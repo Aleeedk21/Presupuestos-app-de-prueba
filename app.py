@@ -1,16 +1,32 @@
 """
-App de Presupuestos - Servicio Técnico de Aire Acondicionado
+Gestor de Presupuestos - Multi Rubro
 --------------------------------------------------------------
+Pensada para cualquier oficio (aire acondicionado, electricidad,
+plomería, albañilería, pintura, gasista, etc.), no solo climatización.
+
 Ejecutar con:
     streamlit run app.py
 
 Instalar dependencias:
-    pip install streamlit fpdf2 pandas
+    pip install streamlit fpdf2 pandas plotly
+
+Notas para quien esté aprendiendo Python con este código:
+- RUBROS es un diccionario que funciona como "tabla de configuración":
+  en vez de escribir un if/elif gigante por cada rubro, buscamos sus
+  datos con RUBROS[nombre_del_rubro]. Es un patrón muy común.
+- En la pestaña "Panel" usamos pandas para transformar la lista de
+  presupuestos (que es una lista de diccionarios) en una tabla, y
+  poder agruparla y sumarla fácil con groupby(). Fijate que en la
+  pestaña "Nuevo Presupuesto" hacemos ese mismo tipo de resumen a
+  mano con un diccionario común (ver `resumen_por_categoria`) — es
+  la misma idea, pandas simplemente lo hace más cómodo cuando hay
+  muchos datos.
 """
 
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
+import plotly.express as px
 import json
 import os
 import base64
@@ -25,37 +41,86 @@ DATA_FILE = "historial_presupuestos.json"
 CONFIG_FILE = "config_empresa.json"
 
 NAVY_RGB = (11, 37, 69)
-
-CATEGORIAS = [
-    "Instalación Split",
-    "Mantenimiento / Limpieza",
-    "Detección / Reparación de Fugas",
-    "Diagnóstico / Reparación Eléctrica",
-    "Carga de Refrigerante",
-    "Otro",
-]
+PALETA_GRAFICOS = ["#2F6FD6", "#1FA97A", "#E0972B", "#D1445C", "#8E6FD6", "#3FB6C9"]
 
 ESTADOS = ["Pendiente", "Aprobado", "Rechazado", "Completado"]
 
-# Precios de referencia: son sugerencias de partida, editables al agregar el ítem
-# y modificables directamente en este listado según tus propios precios reales.
-SERVICIOS_PREDEFINIDOS = [
-    {"categoria": "Instalación Split", "descripcion": "Instalación Split 3000 frigorías (mano de obra)", "precio": 45000.0},
-    {"categoria": "Instalación Split", "descripcion": "Instalación Split 4500 frigorías (mano de obra)", "precio": 55000.0},
-    {"categoria": "Mantenimiento / Limpieza", "descripcion": "Mantenimiento y limpieza profunda", "precio": 20000.0},
-    {"categoria": "Detección / Reparación de Fugas", "descripcion": "Detección de fuga de gas", "precio": 25000.0},
-    {"categoria": "Diagnóstico / Reparación Eléctrica", "descripcion": "Cambio de capacitor", "precio": 12000.0},
-    {"categoria": "Carga de Refrigerante", "descripcion": "Carga de gas R410A", "precio": 30000.0},
-    {"categoria": "Carga de Refrigerante", "descripcion": "Carga de gas R22", "precio": 28000.0},
+# --------------------------------------------------------------
+# RUBROS: acá vive toda la configuración por oficio. Agregar un
+# rubro nuevo es simplemente sumar una entrada a este diccionario,
+# el resto de la app lo toma automáticamente.
+# --------------------------------------------------------------
+RUBROS = {
+    "Aire Acondicionado": {
+        "categorias": [
+            "Instalación Split", "Mantenimiento / Limpieza",
+            "Detección / Reparación de Fugas", "Diagnóstico / Reparación Eléctrica",
+            "Carga de Refrigerante", "Otro",
+        ],
+        "servicios": [
+            {"categoria": "Instalación Split", "descripcion": "Instalación Split 3000 frigorías (mano de obra)", "precio": 45000.0},
+            {"categoria": "Instalación Split", "descripcion": "Instalación Split 4500 frigorías (mano de obra)", "precio": 55000.0},
+            {"categoria": "Mantenimiento / Limpieza", "descripcion": "Mantenimiento y limpieza profunda", "precio": 20000.0},
+            {"categoria": "Detección / Reparación de Fugas", "descripcion": "Detección de fuga de gas", "precio": 25000.0},
+            {"categoria": "Diagnóstico / Reparación Eléctrica", "descripcion": "Cambio de capacitor", "precio": 12000.0},
+            {"categoria": "Carga de Refrigerante", "descripcion": "Carga de gas R410A", "precio": 30000.0},
+        ],
+    },
+    "Electricidad": {
+        "categorias": ["Instalación Eléctrica", "Tablero y Protecciones", "Reparación de Fallas", "Certificación", "Otro"],
+        "servicios": [
+            {"categoria": "Instalación Eléctrica", "descripcion": "Instalación de toma corriente", "precio": 8000.0},
+            {"categoria": "Instalación Eléctrica", "descripcion": "Instalación de punto de luz", "precio": 7000.0},
+            {"categoria": "Tablero y Protecciones", "descripcion": "Recambio de tablero eléctrico", "precio": 60000.0},
+            {"categoria": "Reparación de Fallas", "descripcion": "Diagnóstico y reparación de cortocircuito", "precio": 15000.0},
+        ],
+    },
+    "Plomería": {
+        "categorias": ["Instalación de Agua", "Destapaciones", "Reparación de Pérdidas", "Sanitarios y Griferías", "Otro"],
+        "servicios": [
+            {"categoria": "Destapaciones", "descripcion": "Destapación de cañería", "precio": 18000.0},
+            {"categoria": "Reparación de Pérdidas", "descripcion": "Reparación de pérdida de agua", "precio": 20000.0},
+            {"categoria": "Sanitarios y Griferías", "descripcion": "Instalación de grifería", "precio": 15000.0},
+        ],
+    },
+    "Albañilería": {
+        "categorias": ["Construcción", "Revoque y Terminaciones", "Colocación de Pisos", "Demolición", "Otro"],
+        "servicios": [
+            {"categoria": "Construcción", "descripcion": "Levantamiento de pared (m2)", "precio": 25000.0},
+            {"categoria": "Revoque y Terminaciones", "descripcion": "Revoque fino (m2)", "precio": 8000.0},
+            {"categoria": "Colocación de Pisos", "descripcion": "Colocación de piso cerámico (m2)", "precio": 12000.0},
+        ],
+    },
+    "Pintura": {
+        "categorias": ["Pintura Interior", "Pintura Exterior", "Preparación de Superficie", "Otro"],
+        "servicios": [
+            {"categoria": "Pintura Interior", "descripcion": "Pintura de pared interior (m2)", "precio": 6000.0},
+            {"categoria": "Pintura Exterior", "descripcion": "Pintura de fachada (m2)", "precio": 9000.0},
+            {"categoria": "Preparación de Superficie", "descripcion": "Lijado y enduido (m2)", "precio": 4000.0},
+        ],
+    },
+    "Gasista": {
+        "categorias": ["Instalación de Gas", "Detección de Fugas", "Certificación", "Otro"],
+        "servicios": [
+            {"categoria": "Instalación de Gas", "descripcion": "Instalación de artefacto a gas", "precio": 25000.0},
+            {"categoria": "Detección de Fugas", "descripcion": "Detección de fuga de gas", "precio": 18000.0},
+        ],
+    },
+    "Otro / Personalizado": {
+        "categorias": ["Mano de Obra", "Materiales", "Otro"],
+        "servicios": [],
+    },
+}
+
+# Adicionales rápidos: son genéricos para que sirvan en cualquier rubro
+# (por eso usan la categoría "Otro", presente en todos los rubros de arriba).
+ADICIONALES_RAPIDOS_GENERICOS = [
+    {"categoria": "Otro", "descripcion": "Mano de obra adicional", "precio": 10000.0},
+    {"categoria": "Otro", "descripcion": "Materiales extra", "precio": 6000.0},
+    {"categoria": "Otro", "descripcion": "Traslado / zona alejada", "precio": 8000.0},
 ]
 
-ADICIONALES_RAPIDOS = [
-    {"categoria": "Otro", "descripcion": "Metro extra de cañería de cobre", "precio": 8000.0},
-    {"categoria": "Otro", "descripcion": "Materiales de aislación", "precio": 6000.0},
-    {"categoria": "Otro", "descripcion": "Trabajo en altura (adicional)", "precio": 15000.0},
-]
-
-st.set_page_config(page_title="Presupuestos - Aire Acondicionado", layout="centered")
+st.set_page_config(page_title="Gestor de Presupuestos", layout="centered")
 
 
 # ============================================================
@@ -96,7 +161,8 @@ def siguiente_id(historial):
 # ============================================================
 def cargar_config():
     default = {
-        "nombre": "Servicio Técnico de Aire Acondicionado",
+        "nombre": "Mi Negocio de Servicios",
+        "rubro": "Aire Acondicionado",
         "telefono": "",
         "zona": "",
         "whatsapp": "",
@@ -141,6 +207,11 @@ def logo_base64_uri(path):
     return None
 
 
+def subtitulo_empresa(empresa):
+    partes = [p for p in [empresa.get("rubro", ""), empresa.get("zona", "")] if p]
+    return " · ".join(partes)
+
+
 # ============================================================
 # GENERACIÓN DE PDF
 # ============================================================
@@ -160,10 +231,16 @@ class PDFPresupuesto(FPDF):
         self.set_font("Helvetica", "B", 16)
         self.set_text_color(*NAVY_RGB)
         self.cell(0, 10, safe_txt(self.empresa.get("nombre", "")), ln=True, align="C")
+
+        partes_info = [x for x in [
+            f"Tel: {self.empresa.get('telefono', '')}" if self.empresa.get("telefono") else "",
+            self.empresa.get("rubro", ""),
+            self.empresa.get("zona", ""),
+        ] if x]
         self.set_font("Helvetica", "", 10)
         self.set_text_color(90, 90, 90)
-        info = f"Tel: {self.empresa.get('telefono', '')}   |   Zona: {self.empresa.get('zona', '')}"
-        self.cell(0, 6, safe_txt(info), ln=True, align="C")
+        self.cell(0, 6, safe_txt("   |   ".join(partes_info)), ln=True, align="C")
+
         self.set_draw_color(*NAVY_RGB)
         self.set_line_width(0.6)
         self.line(10, self.get_y() + 2, 200, self.get_y() + 2)
@@ -255,11 +332,63 @@ def generar_pdf(presupuesto, empresa) -> bytes:
 
 
 # ============================================================
-# ESTILOS (paleta azul marino / blanco, sin emojis)
+# DATOS PARA EL PANEL (pandas)
+# ============================================================
+def construir_dataframe_historial(historial):
+    """Convierte la lista de presupuestos (lista de diccionarios) en una
+    tabla de pandas, para poder agrupar y sumar fácil."""
+    filas = []
+    for p in historial:
+        fecha_dt = datetime.strptime(p["fecha"], "%d/%m/%Y")
+        filas.append({
+            "id": p["id"],
+            "fecha": fecha_dt,
+            "mes": fecha_dt.strftime("%Y-%m"),
+            "cliente": p["cliente_nombre"],
+            "estado": p.get("estado", "Pendiente"),
+            "total": p["total"],
+        })
+    return pd.DataFrame(filas)
+
+
+def construir_dataframe_items(historial):
+    """Aplana los ítems de todos los presupuestos en una sola tabla,
+    para poder ver cuánto facturamos por categoría de servicio."""
+    filas = []
+    for p in historial:
+        for item in p["items"]:
+            filas.append({"categoria": item["categoria"], "subtotal": item["subtotal"]})
+    return pd.DataFrame(filas)
+
+
+def estilizar_grafico(fig):
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font_color="#EAF1FB",
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(bgcolor="rgba(0,0,0,0)"),
+    )
+    fig.update_xaxes(gridcolor="#26456F")
+    fig.update_yaxes(gridcolor="#26456F")
+    return fig
+
+
+def kpi_card(label, value, color_class):
+    # Todo en una sola línea: si el HTML queda indentado dentro de un
+    # string multilínea, Streamlit lo puede interpretar como bloque de
+    # código en vez de HTML real.
+    return f'<div class="kpi-card {color_class}"><div class="kpi-label">{label}</div><div class="kpi-value">{value}</div></div>'
+
+
+# ============================================================
+# ESTILOS (paleta azul marino / blanco, sin emojis, más profundidad)
 # ============================================================
 st.markdown(
     """
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+
     :root {
         --navy: #0B2545;
         --navy-light: #163A6B;
@@ -267,8 +396,13 @@ st.markdown(
         --accent-hover: #4C8CF0;
         --text-light: #EAF1FB;
         --border: #26456F;
+        --green: #1FA97A;
+        --orange: #E0972B;
+        --red: #D1445C;
     }
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     h1, h2, h3, h4 { color: var(--text-light) !important; }
+
     div.stButton > button, div.stDownloadButton > button, div[data-testid="stFormSubmitButton"] > button {
         background-color: var(--accent);
         color: #FFFFFF !important;
@@ -276,35 +410,43 @@ st.markdown(
         border: none;
         padding: 0.55em 1.2em;
         font-weight: 600;
+        transition: transform 0.05s ease-in;
     }
     div.stButton > button:hover, div.stDownloadButton > button:hover,
     div[data-testid="stFormSubmitButton"] > button:hover {
         background-color: var(--accent-hover);
         color: #FFFFFF !important;
     }
+    div.stButton > button:active { transform: scale(0.98); }
+
     [data-testid="stMetric"] {
         background-color: var(--navy-light);
         border: 1px solid var(--border);
         border-radius: 12px;
         padding: 10px 16px;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.25);
     }
     [data-testid="stMetricValue"] { color: var(--text-light) !important; }
     [data-testid="stMetricLabel"] { color: var(--text-light) !important; }
+
     div[data-testid="stExpander"], div[data-testid="stForm"] {
         border-radius: 12px;
         border: 1px solid var(--border);
         background-color: var(--navy-light);
     }
+
     .header-banner {
         background: linear-gradient(135deg, var(--navy-light), var(--accent));
         padding: 22px 16px;
-        border-radius: 14px;
+        border-radius: 16px;
         text-align: center;
-        margin-bottom: 22px;
+        margin-bottom: 20px;
+        box-shadow: 0 6px 16px rgba(0,0,0,0.3);
     }
     .header-banner img { max-height: 60px; margin-bottom: 6px; }
     .header-banner h1 { color: #FFFFFF !important; margin: 0; font-size: 1.6rem; }
     .header-banner p { color: #D7E0EC !important; margin: 4px 0 0 0; font-size: 0.9rem; }
+
     .wa-button {
         display: inline-block;
         width: 100%;
@@ -319,6 +461,40 @@ st.markdown(
         margin-top: 8px;
     }
     .wa-button:hover { background-color: var(--accent-hover); }
+
+    /* Tarjetas de resumen estilo "Money Manager" */
+    .kpi-row {
+        display: flex;
+        gap: 12px;
+        overflow-x: auto;
+        padding-bottom: 6px;
+        margin-bottom: 8px;
+    }
+    .kpi-card {
+        flex: 1 1 140px;
+        min-width: 140px;
+        border-radius: 16px;
+        padding: 16px;
+        color: #FFFFFF;
+        box-shadow: 0 6px 14px rgba(0,0,0,0.3);
+    }
+    .kpi-card .kpi-label { font-size: 0.75rem; opacity: 0.9; }
+    .kpi-card .kpi-value { font-size: 1.35rem; font-weight: 700; margin-top: 4px; }
+    .kpi-blue { background: linear-gradient(135deg, var(--navy-light), var(--accent)); }
+    .kpi-green { background: linear-gradient(135deg, #0F6A4C, var(--green)); }
+    .kpi-orange { background: linear-gradient(135deg, #8A5A12, var(--orange)); }
+    .kpi-red { background: linear-gradient(135deg, #7A1F2B, var(--red)); }
+
+    /* Chips de resumen por categoría */
+    .chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 4px 0; }
+    .chip {
+        background: var(--navy-light);
+        border: 1px solid var(--border);
+        color: var(--text-light);
+        padding: 4px 12px;
+        border-radius: 999px;
+        font-size: 0.78rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -345,24 +521,98 @@ def mostrar_banner():
     logo_uri = logo_base64_uri(empresa.get("logo_path", ""))
     logo_html = f'<img src="{logo_uri}" />' if logo_uri else ""
     nombre = empresa.get("nombre", "")
-    zona = empresa.get("zona", "")
-    # Todo en una sola línea, sin sangría: si el HTML queda indentado dentro
-    # de un string multilínea, Streamlit lo interpreta como bloque de código
-    # y lo muestra como texto en vez de renderizarlo.
-    banner_html = f'<div class="header-banner">{logo_html}<h1>{nombre}</h1><p>{zona}</p></div>'
+    subtitulo = subtitulo_empresa(empresa)
+    banner_html = f'<div class="header-banner">{logo_html}<h1>{nombre}</h1><p>{subtitulo}</p></div>'
     st.markdown(banner_html, unsafe_allow_html=True)
 
 
 mostrar_banner()
 
-tab_nuevo, tab_personalizar, tab_historial = st.tabs(
-    ["Nuevo Presupuesto", "Personalizar Factura", "Historial"]
+tab_panel, tab_nuevo, tab_personalizar, tab_historial = st.tabs(
+    ["Panel", "Nuevo Presupuesto", "Personalizar Factura", "Historial"]
 )
+
+# ------------------------------------------------------------
+# TAB 0: PANEL (dashboard con pandas + plotly)
+# ------------------------------------------------------------
+with tab_panel:
+    historial_panel = cargar_historial()
+
+    if not historial_panel:
+        st.info("Todavía no generaste ningún presupuesto. Los indicadores van a aparecer acá a medida que cargues datos.")
+    else:
+        df_hist = construir_dataframe_historial(historial_panel)
+        df_items = construir_dataframe_items(historial_panel)
+
+        mes_actual = date.today().strftime("%Y-%m")
+        total_historico = df_hist["total"].sum()
+        total_mes = df_hist.loc[df_hist["mes"] == mes_actual, "total"].sum()
+        cantidad_pendientes = int((df_hist["estado"] == "Pendiente").sum())
+        cantidad_aprobados = int((df_hist["estado"] == "Aprobado").sum())
+
+        cards_html = (
+            '<div class="kpi-row">'
+            + kpi_card("Facturado histórico", f"$ {total_historico:,.0f}", "kpi-blue")
+            + kpi_card("Facturado este mes", f"$ {total_mes:,.0f}", "kpi-green")
+            + kpi_card("Pendientes", str(cantidad_pendientes), "kpi-orange")
+            + kpi_card("Aprobados", str(cantidad_aprobados), "kpi-green")
+            + "</div>"
+        )
+        st.markdown(cards_html, unsafe_allow_html=True)
+
+        st.write("")
+        st.subheader("Facturación por mes")
+        df_mensual = df_hist.groupby("mes", as_index=False)["total"].sum().sort_values("mes")
+        fig_mensual = px.bar(df_mensual, x="mes", y="total", labels={"mes": "Mes", "total": "Total facturado"})
+        fig_mensual.update_traces(marker_color="#2F6FD6")
+        st.plotly_chart(estilizar_grafico(fig_mensual), use_container_width=True)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.subheader("Por estado")
+            df_estado = df_hist.groupby("estado", as_index=False).size().rename(columns={"size": "cantidad"})
+            fig_estado = px.pie(
+                df_estado, names="estado", values="cantidad", hole=0.55,
+                color_discrete_sequence=PALETA_GRAFICOS,
+            )
+            st.plotly_chart(estilizar_grafico(fig_estado), use_container_width=True)
+
+        with col_b:
+            st.subheader("Por categoría")
+            if not df_items.empty:
+                df_categoria = (
+                    df_items.groupby("categoria", as_index=False)["subtotal"]
+                    .sum()
+                    .sort_values("subtotal", ascending=True)
+                )
+                fig_categoria = px.bar(
+                    df_categoria, x="subtotal", y="categoria", orientation="h",
+                    color_discrete_sequence=PALETA_GRAFICOS,
+                    labels={"subtotal": "Total", "categoria": ""},
+                )
+                st.plotly_chart(estilizar_grafico(fig_categoria), use_container_width=True)
+
+        st.subheader("Top clientes")
+        df_top_clientes = (
+            df_hist.groupby("cliente", as_index=False)["total"]
+            .sum()
+            .sort_values("total", ascending=False)
+            .head(5)
+            .rename(columns={"cliente": "Cliente", "total": "Total facturado"})
+        )
+        st.dataframe(df_top_clientes, use_container_width=True, hide_index=True)
 
 # ------------------------------------------------------------
 # TAB 1: NUEVO PRESUPUESTO
 # ------------------------------------------------------------
 with tab_nuevo:
+    rubro_actual = st.session_state.empresa.get("rubro", "Aire Acondicionado")
+    config_rubro = RUBROS.get(rubro_actual, RUBROS["Otro / Personalizado"])
+    categorias_actuales = config_rubro["categorias"]
+    servicios_actuales = config_rubro["servicios"]
+
+    st.caption(f"Rubro actual: {rubro_actual} (se cambia en \"Personalizar Factura\")")
+
     st.subheader("Datos del Cliente")
     cliente_nombre = st.text_input("Nombre y Apellido", key="cliente_nombre_input")
     col1, col2 = st.columns(2)
@@ -375,13 +625,13 @@ with tab_nuevo:
     st.divider()
     st.subheader("Detalle del Trabajo")
 
-    opciones_serv = ["Personalizado..."] + [s["descripcion"] for s in SERVICIOS_PREDEFINIDOS]
+    opciones_serv = ["Personalizado..."] + [s["descripcion"] for s in servicios_actuales]
     seleccion = st.selectbox("Servicio predefinido (opcional)", opciones_serv)
-    servicio_sugerido = next((s for s in SERVICIOS_PREDEFINIDOS if s["descripcion"] == seleccion), None)
+    servicio_sugerido = next((s for s in servicios_actuales if s["descripcion"] == seleccion), None)
 
     with st.form("form_item", clear_on_submit=True):
-        categoria_default = servicio_sugerido["categoria"] if servicio_sugerido else CATEGORIAS[0]
-        categoria = st.selectbox("Categoría", CATEGORIAS, index=CATEGORIAS.index(categoria_default))
+        categoria_default = servicio_sugerido["categoria"] if servicio_sugerido else categorias_actuales[0]
+        categoria = st.selectbox("Categoría", categorias_actuales, index=categorias_actuales.index(categoria_default))
         descripcion = st.text_input(
             "Descripción del concepto",
             value=servicio_sugerido["descripcion"] if servicio_sugerido else "",
@@ -417,8 +667,8 @@ with tab_nuevo:
                 st.success("Ítem agregado.")
 
     st.caption("Adicionales rápidos")
-    cols_add = st.columns(len(ADICIONALES_RAPIDOS))
-    for c, ad in zip(cols_add, ADICIONALES_RAPIDOS):
+    cols_add = st.columns(len(ADICIONALES_RAPIDOS_GENERICOS))
+    for c, ad in zip(cols_add, ADICIONALES_RAPIDOS_GENERICOS):
         with c:
             if st.button(ad["descripcion"], key=f"add_{ad['descripcion']}", use_container_width=True):
                 st.session_state.lista_items.append(
@@ -435,18 +685,18 @@ with tab_nuevo:
     st.write("Ítems del presupuesto (editable directamente en la tabla)")
     columnas_items = ["categoria", "descripcion", "cantidad", "precio_unitario", "subtotal"]
     if st.session_state.lista_items:
-        df_items = pd.DataFrame(st.session_state.lista_items)[columnas_items]
+        df_items_edit = pd.DataFrame(st.session_state.lista_items)[columnas_items]
     else:
-        df_items = pd.DataFrame(columns=columnas_items)
+        df_items_edit = pd.DataFrame(columns=columnas_items)
 
     edited_df = st.data_editor(
-        df_items,
+        df_items_edit,
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
         key=f"editor_items_{st.session_state.reset_counter}",
         column_config={
-            "categoria": st.column_config.SelectboxColumn("Categoría", options=CATEGORIAS),
+            "categoria": st.column_config.SelectboxColumn("Categoría", options=categorias_actuales),
             "descripcion": st.column_config.TextColumn("Descripción", width="large"),
             "cantidad": st.column_config.NumberColumn("Cant.", min_value=1, step=1),
             "precio_unitario": st.column_config.NumberColumn("P. Unit.", min_value=0.0, format="$ %.2f"),
@@ -457,9 +707,23 @@ with tab_nuevo:
     edited_df["cantidad"] = edited_df["cantidad"].fillna(1)
     edited_df["precio_unitario"] = edited_df["precio_unitario"].fillna(0.0)
     edited_df["subtotal"] = edited_df["cantidad"] * edited_df["precio_unitario"]
-    edited_df["categoria"] = edited_df["categoria"].fillna(CATEGORIAS[0])
+    edited_df["categoria"] = edited_df["categoria"].fillna(categorias_actuales[0])
     edited_df["descripcion"] = edited_df["descripcion"].fillna("")
     st.session_state.lista_items = edited_df.to_dict("records")
+
+    # Resumen por categoría hecho "a mano" con un diccionario común.
+    # (En la pestaña Panel hacemos lo mismo con pandas groupby, que
+    # conviene cuando hay muchos datos acumulados en el historial).
+    if st.session_state.lista_items:
+        resumen_por_categoria = {}
+        for it in st.session_state.lista_items:
+            resumen_por_categoria[it["categoria"]] = resumen_por_categoria.get(it["categoria"], 0) + it["subtotal"]
+
+        chips_html = "".join(
+            f'<span class="chip">{cat}: $ {monto:,.0f}</span>'
+            for cat, monto in resumen_por_categoria.items()
+        )
+        st.markdown(f'<div class="chip-row">{chips_html}</div>', unsafe_allow_html=True)
 
     st.divider()
     st.subheader("Descuento y Envío")
@@ -475,8 +739,8 @@ with tab_nuevo:
     validez = st.session_state.empresa.get("validez_dias", 7)
     notas_default = (
         f"Presupuesto válido por {validez} días.\n"
-        "No incluye trabajo de albañilería.\n"
-        "Garantía de instalación: 6 meses."
+        "No incluye materiales no especificados.\n"
+        "Garantía del trabajo realizado: 6 meses."
     )
     notas = st.text_area("Notas / Condiciones", value=notas_default, height=100)
 
@@ -485,12 +749,14 @@ with tab_nuevo:
     total = subtotal - descuento_monto + envio
 
     st.divider()
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Subtotal", f"$ {subtotal:,.2f}")
     with col2:
         st.metric("Descuento", f"$ {descuento_monto:,.2f}")
     with col3:
+        st.metric("Envío", f"$ {envio:,.2f}")
+    with col4:
         st.metric("Total", f"$ {total:,.2f}")
 
     st.divider()
@@ -589,6 +855,15 @@ with tab_personalizar:
     empresa = st.session_state.empresa
 
     nombre_emp = st.text_input("Nombre / Marca", value=empresa.get("nombre", ""))
+
+    opciones_rubro = list(RUBROS.keys())
+    rubro_guardado = empresa.get("rubro", "Aire Acondicionado")
+    rubro_emp = st.selectbox(
+        "Rubro / Actividad",
+        opciones_rubro,
+        index=opciones_rubro.index(rubro_guardado) if rubro_guardado in opciones_rubro else 0,
+    )
+
     col1, col2 = st.columns(2)
     with col1:
         telefono_emp = st.text_input("Teléfono", value=empresa.get("telefono", ""))
@@ -622,6 +897,7 @@ with tab_personalizar:
 
     if st.button("Guardar cambios", type="primary", use_container_width=True):
         empresa["nombre"] = nombre_emp.strip()
+        empresa["rubro"] = rubro_emp
         empresa["telefono"] = telefono_emp.strip()
         empresa["zona"] = zona_emp.strip()
         empresa["whatsapp"] = whatsapp_emp.strip()
