@@ -265,8 +265,8 @@ class PDFPresupuesto(FPDF):
         if firma:
             self.cell(0, 5, safe_txt(firma), ln=True, align="C")
         texto = f"Presupuesto generado el {datetime.now().strftime('%d/%m/%Y %H:%M')} - Página {self.page_no()}"
-     self.cell(0, 5, safe_txt(texto), ln=True, align="C")
-    self.cell(0, 5, "Hecho con NOMBRE_APP - tu-link.streamlit.app", align="C")
+        self.cell(0, 5, safe_txt(texto), ln=True, align="C")
+        self.cell(0, 5, "Hecho con Paperlit - https://presupuestosclima.streamlit.app/", align="C")
 
 
 def generar_pdf(presupuesto, empresa) -> bytes:
