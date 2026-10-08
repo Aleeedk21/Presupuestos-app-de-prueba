@@ -5,7 +5,7 @@ Pensada para cualquier oficio (aire acondicionado, electricidad,
 plomería, albañilería, pintura, gasista, etc.), no solo climatización.
 
 Ejecutar con:
-    streamlit run app.py
+    python -m streamlit run app.py
 
 Instalar dependencias:
     pip install streamlit fpdf2 pandas plotly
@@ -21,14 +21,23 @@ Notas para quien esté aprendiendo Python con este código:
   mano con un diccionario común (ver `resumen_por_categoria`) — es
   la misma idea, pandas simplemente lo hace más cómodo cuando hay
   muchos datos.
+- CALLBACKS (on_click / on_change): son funciones que Streamlit ejecuta
+  ANTES de volver a correr el script, apenas el usuario toca un botón o
+  cambia un campo. Son la forma correcta de modificar el valor de otros
+  campos (por ejemplo, rellenar la descripción al elegir un servicio).
+  Si intentás cambiar el valor de un campo después de que ya se dibujó
+  en pantalla, Streamlit da error.
 """
 
+import http
+
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import plotly.express as px
 import json
 import os
+import shutil
+import uuid
 import base64
 from datetime import date, datetime
 from urllib.parse import quote
@@ -39,20 +48,31 @@ from fpdf import FPDF
 # ============================================================
 os.makedirs("datos", exist_ok=True)
 
-def archivo_historial():
-    return f"datos/historial_{st.session_state.codigo}.json"
-
-def archivo_config():
-    return f"datos/config_{st.session_state.codigo}.json"
-
 # Links de Google Forms (pegá acá tus links entre las comillas)
 URL_FORMULARIO_OPINION = "https://share.forms.app/garciaclima/contanos-que-te-parecio-paperlit"  # formulario de opiniones (3 preguntas)
 URL_FORMULARIO_PRO = "https://share.forms.app/garciaclima/sumate-a-la-lista-de-espera-de-paperlit-pro"      # formulario de interés en el Plan Pro (mail)
+
+# URL actual de la app: se imprime en el pie de página del PDF.
+# Pegá acá la dirección vigente (ej: "https://tuapp.streamlit.app/").
+# Si la dejás vacía, el pie muestra solo "Hecho con Presupify".
+URL_APP = "https://presupify.streamlit.app/"
 
 NAVY_RGB = (11, 37, 69)
 PALETA_GRAFICOS = ["#2F6FD6", "#1FA97A", "#E0972B", "#D1445C", "#8E6FD6", "#3FB6C9"]
 
 ESTADOS = ["Pendiente", "Aprobado", "Rechazado", "Completado"]
+
+# Límites para las notas/condiciones: evitan que un texto larguísimo
+# deforme el PDF o empuje contenido a una página extra.
+MAX_CHARS_NOTAS = 600
+MAX_LINEAS_NOTAS = 12
+
+# Config de Plotly: sin barra de herramientas ni zoom con la rueda, para
+# que en el celular el gráfico no "robe" el scroll de la página.
+CONFIG_PLOTLY = {"displayModeBar": False, "scrollZoom": False}
+
+# Texto de la primera opción del desplegable de servicios
+OPCION_PERSONALIZADO = "Personalizado..."
 
 # --------------------------------------------------------------
 # RUBROS: acá vive toda la configuración por oficio. Agregar un
@@ -121,41 +141,80 @@ RUBROS = {
     },
 }
 
-# Adicionales rápidos: son genéricos para que sirvan en cualquier rubro
-# (por eso usan la categoría "Otro", presente en todos los rubros de arriba).
+# Adicionales rápidos POR DEFECTO. Cada negocio puede editarlos desde la
+# pestaña "Configuración del Negocio" (se guardan en su configuración).
+# Usan la categoría "Otro", presente en todos los rubros de arriba.
 ADICIONALES_RAPIDOS_GENERICOS = [
     {"categoria": "Otro", "descripcion": "Mano de obra adicional", "precio": 10000.0},
     {"categoria": "Otro", "descripcion": "Materiales extra", "precio": 6000.0},
     {"categoria": "Otro", "descripcion": "Traslado / zona alejada", "precio": 8000.0},
 ]
 
-st.set_page_config(page_title="Gestor de Presupuestos", layout="centered")
-codigo_url = st.query_params.get("codigo", "")
-codigo = st.text_input(
-    "Tu código personal (inventá uno, ej: juan2026)",
-    value=codigo_url,
-    key="codigo_input",
+# set_page_config tiene que ser el PRIMER comando de Streamlit del script.
+st.set_page_config(
+    page_title="Gestor de Presupuestos",
+    layout="centered",
+    initial_sidebar_state="collapsed",  # la barra lateral (código personal) queda como opción secundaria
 )
-codigo = "".join(c for c in codigo if c.isalnum()).lower()
-if len(codigo) < 4:
-    st.info("Escribí un código de al menos 4 letras o números para empezar.")
-    st.stop()
-st.query_params["codigo"] = codigo  # queda en el link: si la página se recarga, entra sola
-st.session_state.codigo = codigo
 
 
 # ============================================================
-# UTILIDADES DE TEXTO (evita errores de codificación en el PDF)
+# UTILIDADES GENERALES
 # ============================================================
 def safe_txt(s: str) -> str:
+    """Evita errores de codificación en el PDF (Helvetica solo entiende latin-1)."""
     if s is None:
         return ""
     return str(s).encode("latin-1", "replace").decode("latin-1")
 
 
+def dinero(valor) -> str:
+    """Formatea un monto para mostrarlo en texto Markdown.
+    La barra invertida evita que Streamlit tome dos signos $ como una fórmula."""
+    return f"\\$ {valor:,.2f}"
+
+
+def normalizar_codigo(texto) -> str:
+    """Deja solo letras y números, en minúscula (así el código sirve como nombre de archivo)."""
+    return "".join(c for c in str(texto) if c.isalnum()).lower()
+
+
+def config_del_rubro(rubro):
+    """Devuelve categorías y servicios del rubro (o los genéricos si no existe)."""
+    return RUBROS.get(rubro, RUBROS["Otro / Personalizado"])
+
+
+def limpiar_notas(texto) -> str:
+    """Prepara las notas para el PDF: sin líneas vacías repetidas ni espacios
+    al final (causan páginas en blanco) y con un tope de líneas y caracteres."""
+    lineas = []
+    for linea in str(texto or "").strip().splitlines():
+        linea = linea.rstrip()
+        if not linea and (not lineas or not lineas[-1]):
+            continue
+        lineas.append(linea)
+    texto = "\n".join(lineas[:MAX_LINEAS_NOTAS]).strip()
+    if len(texto) > MAX_CHARS_NOTAS:
+        texto = texto[:MAX_CHARS_NOTAS].rstrip() + "..."
+    return texto
+
+
+def limpiar_telefono(texto) -> str:
+    """Deja solo dígitos en un número de teléfono (remueve espacios, guiones, +)."""
+    return "".join(c for c in str(texto or "") if c.isdigit())
+
+
 # ============================================================
-# PERSISTENCIA - HISTORIAL DE PRESUPUESTOS
+# PERSISTENCIA - ARCHIVOS POR CÓDIGO DE SESIÓN
 # ============================================================
+def archivo_historial(codigo=None):
+    return f"datos/historial_{codigo or st.session_state.codigo}.json"
+
+
+def archivo_config(codigo=None):
+    return f"datos/config_{codigo or st.session_state.codigo}.json"
+
+
 def cargar_historial():
     if os.path.exists(archivo_historial()):
         try:
@@ -172,14 +231,12 @@ def guardar_historial(historial):
 
 
 def siguiente_id(historial):
+    """Número sugerido para el próximo presupuesto (el usuario puede cambiarlo)."""
     if not historial:
         return 1
     return max(p["id"] for p in historial) + 1
 
 
-# ============================================================
-# PERSISTENCIA - CONFIGURACIÓN DE LA EMPRESA
-# ============================================================
 def cargar_config():
     default = {
         "nombre": "Mi Negocio de Servicios",
@@ -190,6 +247,7 @@ def cargar_config():
         "validez_dias": 7,
         "firma_texto": "",
         "logo_path": "",
+        "adicionales": [dict(a) for a in ADICIONALES_RAPIDOS_GENERICOS],
     }
     if os.path.exists(archivo_config()):
         try:
@@ -233,6 +291,23 @@ def subtitulo_empresa(empresa):
     return " · ".join(partes)
 
 
+def migrar_datos(codigo_origen, codigo_destino, config_actual):
+    """Copia historial, configuración y logo de un código a otro.
+    Se usa cuando alguien que venía con la sesión automática elige un código
+    personal: así no pierde lo que ya cargó."""
+    if os.path.exists(archivo_historial(codigo_origen)):
+        shutil.copy(archivo_historial(codigo_origen), archivo_historial(codigo_destino))
+
+    config = dict(config_actual)
+    logo = config.get("logo_path", "")
+    if logo and os.path.exists(logo):
+        nuevo_logo = f"datos/logo_{codigo_destino}{extension_archivo(logo)}"
+        shutil.copy(logo, nuevo_logo)
+        config["logo_path"] = nuevo_logo
+    with open(archivo_config(codigo_destino), "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+
 # ============================================================
 # GENERACIÓN DE PDF
 # ============================================================
@@ -240,6 +315,9 @@ class PDFPresupuesto(FPDF):
     def __init__(self, empresa):
         super().__init__()
         self.empresa = empresa
+        # El margen inferior de 25 mm deja lugar al pie de página: el contenido
+        # nunca se superpone con el footer ni genera páginas sobrantes.
+        self.set_auto_page_break(auto=True, margin=25)
 
     def header(self):
         logo_path = self.empresa.get("logo_path", "")
@@ -268,7 +346,7 @@ class PDFPresupuesto(FPDF):
         self.ln(8)
 
     def footer(self):
-        self.set_y(-20)
+        self.set_y(-22)
         self.set_font("Helvetica", "I", 8)
         self.set_text_color(130, 130, 130)
         firma = self.empresa.get("firma_texto", "")
@@ -276,7 +354,9 @@ class PDFPresupuesto(FPDF):
             self.cell(0, 5, safe_txt(firma), ln=True, align="C")
         texto = f"Presupuesto generado el {datetime.now().strftime('%d/%m/%Y %H:%M')} - Página {self.page_no()}"
         self.cell(0, 5, safe_txt(texto), ln=True, align="C")
-        self.cell(0, 5, "Hecho con Paperlit - https://presupuestosclima.streamlit.app/", align="C")
+        marca = "Hecho con Presupify" + (f" - {URL_APP}" if URL_APP else "")
+        self.cell(0, 5, safe_txt(marca), align="C")
+
 
 def ajustar_texto(pdf, texto, ancho):
     texto = safe_txt(texto)
@@ -285,6 +365,8 @@ def ajustar_texto(pdf, texto, ancho):
     while texto and pdf.get_string_width(texto + "...") > ancho - 2:
         texto = texto[:-1]
     return texto + "..."
+
+
 def generar_pdf(presupuesto, empresa) -> bytes:
     pdf = PDFPresupuesto(empresa)
     pdf.add_page()
@@ -321,7 +403,7 @@ def generar_pdf(presupuesto, empresa) -> bytes:
     for item in presupuesto["items"]:
         pdf.set_fill_color(240, 240, 240)
         pdf.cell(col_widths[0], 7, ajustar_texto(pdf, item["descripcion"], col_widths[0]), border=1, fill=fill)
-        pdf.cell(col_widths[1], 7, str(item["cantidad"]), border=1, align="C", fill=fill)
+        pdf.cell(col_widths[1], 7, f"{item['cantidad']:g}", border=1, align="C", fill=fill)
         pdf.cell(col_widths[2], 7, f"${item['precio_unitario']:,.2f}", border=1, align="R", fill=fill)
         pdf.cell(col_widths[3], 7, f"${item['subtotal']:,.2f}", border=1, align="R", fill=fill)
         pdf.ln()
@@ -335,7 +417,7 @@ def generar_pdf(presupuesto, empresa) -> bytes:
     pdf.cell(col_widths[3], 7, f"${presupuesto['subtotal']:,.2f}", align="R", ln=True)
 
     if presupuesto.get("descuento_pct", 0) > 0:
-        pdf.cell(x_label, 7, safe_txt(f"Descuento ({presupuesto['descuento_pct']}%)"), align="R")
+        pdf.cell(x_label, 7, safe_txt(f"Descuento ({presupuesto['descuento_pct']:g}%)"), align="R")
         pdf.cell(col_widths[3], 7, f"-${presupuesto['descuento_monto']:,.2f}", align="R", ln=True)
 
     if presupuesto.get("envio", 0) > 0:
@@ -350,11 +432,24 @@ def generar_pdf(presupuesto, empresa) -> bytes:
     pdf.set_text_color(0, 0, 0)
     pdf.ln(6)
 
-    if presupuesto.get("notas"):
+    # Las notas pasan por limpiar_notas(): tope de caracteres y de líneas.
+    notas = limpiar_notas(presupuesto.get("notas", ""))
+    if notas:
+        # Se calcula cuántas líneas ocupa el texto para no dejar el título
+        # "Notas / Condiciones" solo al final de una página.
+        pdf.set_font("Helvetica", "", 9)
+        try:
+            lineas_notas = len(pdf.multi_cell(0, 5, safe_txt(notas), dry_run=True, output="LINES"))
+        except Exception:
+            lineas_notas = len(notas.splitlines()) + 2  # estimación si la versión de fpdf2 no soporta dry_run
+        espacio_libre = pdf.h - pdf.b_margin - pdf.get_y()
+        if espacio_libre < 7 + lineas_notas * 5:
+            pdf.add_page()
+
         pdf.set_font("Helvetica", "B", 10)
         pdf.cell(0, 7, safe_txt("Notas / Condiciones"), ln=True)
         pdf.set_font("Helvetica", "", 9)
-        pdf.multi_cell(0, 5, safe_txt(presupuesto["notas"]))
+        pdf.multi_cell(0, 5, safe_txt(notas))
 
     return bytes(pdf.output())
 
@@ -381,7 +476,7 @@ def construir_dataframe_historial(historial):
 
 def construir_dataframe_items(historial):
     """Aplana los ítems de todos los presupuestos en una sola tabla,
-    para poder ver cuánto facturamos por categoría de servicio."""
+    para poder ver cuánto presupuestamos por categoría de servicio."""
     filas = []
     for p in historial:
         for item in p["items"]:
@@ -396,9 +491,11 @@ def estilizar_grafico(fig):
         font_color="#EAF1FB",
         margin=dict(l=10, r=10, t=30, b=10),
         legend=dict(bgcolor="rgba(0,0,0,0)"),
+        dragmode=False,  # sin arrastre: en el celular no interfiere con el scroll
     )
-    fig.update_xaxes(gridcolor="#26456F")
-    fig.update_yaxes(gridcolor="#26456F")
+    # fixedrange=True desactiva el zoom y el desplazamiento de los ejes.
+    fig.update_xaxes(gridcolor="#26456F", fixedrange=True)
+    fig.update_yaxes(gridcolor="#26456F", fixedrange=True)
     return fig
 
 
@@ -407,6 +504,188 @@ def kpi_card(label, value, color_class):
     # string multilínea, Streamlit lo puede interpretar como bloque de
     # código en vez de HTML real.
     return f'<div class="kpi-card {color_class}"><div class="kpi-label">{label}</div><div class="kpi-value">{value}</div></div>'
+
+
+# ============================================================
+# CALLBACKS (se ejecutan ANTES de redibujar la pantalla)
+# ============================================================
+def reiniciar_campos_item():
+    """Deja el formulario de ítem en blanco, con la primera categoría del rubro."""
+    categorias = config_del_rubro(st.session_state.empresa.get("rubro"))["categorias"]
+    st.session_state.servicio_sel = OPCION_PERSONALIZADO
+    st.session_state.item_categoria = categorias[0]
+    st.session_state.item_descripcion = ""
+    st.session_state.item_cantidad = 1
+    st.session_state.item_precio = 0.0
+
+
+def al_cambiar_rubro():
+    """Guarda el rubro elegido arriba de todo y limpia el formulario de ítem
+    (las categorías y servicios cambian con el rubro)."""
+    st.session_state.empresa["rubro"] = st.session_state.rubro_selector
+    guardar_config(st.session_state.empresa)
+    reiniciar_campos_item()
+
+
+def al_elegir_servicio():
+    """Al elegir un servicio predefinido, rellena categoría, descripción y
+    precio. Con 'Personalizado...' deja descripción y precio en blanco."""
+    seleccion = st.session_state.servicio_sel
+    servicios = config_del_rubro(st.session_state.empresa.get("rubro"))["servicios"]
+    servicio = next((s for s in servicios if s["descripcion"] == seleccion), None)
+
+    if servicio is None:
+        st.session_state.item_descripcion = ""
+        st.session_state.item_precio = 0.0
+        return
+
+    st.session_state.item_categoria = servicio["categoria"]
+    st.session_state.item_descripcion = servicio["descripcion"]
+    st.session_state.item_precio = float(servicio["precio"])
+
+
+def agregar_item():
+    """Valida el formulario y agrega el ítem a la lista. Los avisos se
+    guardan en session_state y se muestran debajo del botón."""
+    descripcion = st.session_state.item_descripcion.strip()
+    cantidad = st.session_state.item_cantidad
+    precio = st.session_state.item_precio
+
+    if not descripcion:
+        st.session_state.aviso_item = ("error", "La descripción no puede estar vacía.")
+        return
+    if precio <= 0:
+        st.session_state.aviso_item = ("error", "El precio unitario debe ser mayor a 0.")
+        return
+
+    st.session_state.lista_items.append(
+        {
+            "categoria": st.session_state.item_categoria,
+            "descripcion": descripcion,
+            "cantidad": cantidad,
+            "precio_unitario": precio,
+            "subtotal": cantidad * precio,
+        }
+    )
+    st.session_state.reset_counter += 1  # refresca la tabla editable
+    reiniciar_campos_item()
+    st.session_state.aviso_item = ("ok", "Ítem agregado.")
+
+
+def agregar_adicional(adicional):
+    """Agrega con un clic uno de los adicionales rápidos."""
+    st.session_state.lista_items.append(
+        {
+            "categoria": adicional.get("categoria", "Otro"),
+            "descripcion": adicional["descripcion"],
+            "cantidad": 1,
+            "precio_unitario": float(adicional["precio"]),
+            "subtotal": float(adicional["precio"]),
+        }
+    )
+    st.session_state.reset_counter += 1
+
+
+def duplicar_presupuesto(presupuesto):
+    """Copia cliente e ítems de un presupuesto viejo al formulario nuevo."""
+    st.session_state.cliente_nombre_input = presupuesto["cliente_nombre"]
+    st.session_state.cliente_direccion_input = presupuesto.get("cliente_direccion", "")
+    st.session_state.cliente_telefono_input = presupuesto.get("cliente_telefono", "")
+    st.session_state.lista_items = [dict(item) for item in presupuesto["items"]]
+    st.session_state.reset_counter += 1
+    st.toast('Datos copiados. Andá a la pestaña "Nuevo Presupuesto".')
+
+
+def limpiar_items():
+    """Borra todos los ítems cargados (por si se cargaron de más)."""
+    st.session_state.lista_items = []
+    st.session_state.reset_counter += 1
+    st.session_state.aviso_item = ("info", "Lista de ítems vaciada.")
+
+
+def eliminar_filas_vacias():
+    """Elimina las filas sin descripción (o sin precio/cantidad útiles) para
+    limpiar las casillas que el usuario agregó sin querer."""
+    antes = len(st.session_state.lista_items)
+    st.session_state.lista_items = [
+        it for it in st.session_state.lista_items
+        if str(it.get("descripcion", "")).strip()
+        and float(it.get("precio_unitario", 0) or 0) > 0
+    ]
+    st.session_state.reset_counter += 1
+    eliminadas = antes - len(st.session_state.lista_items)
+    if eliminadas > 0:
+        st.session_state.aviso_item = ("ok", f"Se eliminaron {eliminadas} fila(s) vacía(s).")
+    else:
+        st.session_state.aviso_item = ("info", "No había filas vacías para borrar.")
+
+
+def aplicar_codigo():
+    """Usa un código personal elegido por el usuario (opcional).
+    - Si ya existen datos con ese código: los recupera.
+    - Si no existen: copia los datos actuales a ese código para no perderlos."""
+    nuevo = normalizar_codigo(st.session_state.codigo_input)
+    anterior = st.session_state.codigo
+
+    if len(nuevo) < 4:
+        st.session_state.aviso_codigo = ("error", "Escribí un código de al menos 4 letras o números.")
+        return
+    if nuevo == anterior:
+        st.session_state.aviso_codigo = ("info", "Ya estás usando ese código.")
+        return
+
+    if os.path.exists(archivo_historial(nuevo)) or os.path.exists(archivo_config(nuevo)):
+        mensaje = "Datos recuperados."
+    else:
+        migrar_datos(anterior, nuevo, st.session_state.empresa)
+        mensaje = "Listo: tus datos actuales quedaron guardados con ese código."
+
+    st.session_state.codigo = nuevo
+    st.query_params["codigo"] = nuevo
+
+    # Se descarta todo lo que pertenecía a la sesión anterior.
+    for clave in ("empresa", "pdf_actual", "pdf_actual_info", "pdf_actual_nombre", "rubro_selector"):
+        st.session_state.pop(clave, None)
+    st.session_state.lista_items = []
+    st.session_state.reset_counter += 1
+    st.session_state.codigo_input = ""
+    st.session_state.aviso_codigo = ("ok", mensaje)
+
+
+# ============================================================
+# SESIÓN: SE USA DE INMEDIATO, SIN PEDIR CÓDIGO
+# ============================================================
+# Si el link ya trae un código (?codigo=...), se usa. Si no, se genera uno
+# temporal único para esta visita. Se deja en el link para que, si la página
+# se recarga, la persona siga con sus datos.
+if "codigo" not in st.session_state:
+    codigo_url = normalizar_codigo(st.query_params.get("codigo", ""))
+    if len(codigo_url) >= 4:
+        st.session_state.codigo = codigo_url
+    else:
+        st.session_state.codigo = "inv" + uuid.uuid4().hex[:10]
+st.query_params["codigo"] = st.session_state.codigo
+
+# ============================================================
+# ESTADO INICIAL DE LA SESIÓN
+# ============================================================
+if "lista_items" not in st.session_state:
+    st.session_state.lista_items = []
+
+if "empresa" not in st.session_state:
+    st.session_state.empresa = cargar_config()
+
+if "pdf_actual" not in st.session_state:
+    st.session_state.pdf_actual = None
+
+if "reset_counter" not in st.session_state:
+    st.session_state.reset_counter = 0
+
+# Valores iniciales de los campos del formulario de ítem
+st.session_state.setdefault("servicio_sel", OPCION_PERSONALIZADO)
+st.session_state.setdefault("item_descripcion", "")
+st.session_state.setdefault("item_cantidad", 1)
+st.session_state.setdefault("item_precio", 0.0)
 
 
 # ============================================================
@@ -473,9 +752,31 @@ st.markdown(
     [data-testid="stTextAreaRootElement"],
     [data-testid="stDateInputField"],
     [data-testid="stSelectbox"] div[role="group"] {
-        border: 2px solid #5B82BE !important;
+        border: 1.5px solid #5B82BE !important;
         border-radius: 10px !important;
-        background-color: rgba(11, 37, 69, 0.55) !important;
+        background-color: rgba(11, 37, 69, 0.6) !important;
+        box-shadow: inset 0 1px 2px rgba(0,0,0,0.18);
+        min-height: 44px;
+    }
+    /* Texto dentro de los inputs: padding y color legible */
+    div[data-baseweb="input"] input,
+    div[data-baseweb="textarea"] textarea,
+    [data-testid="stTextInputRootElement"] input,
+    [data-testid="stNumberInputContainer"] input,
+    [data-testid="stTextAreaRootElement"] textarea,
+    [data-testid="stDateInputField"] input {
+        color: var(--text-light) !important;
+        padding: 8px 12px !important;
+        font-size: 0.95rem !important;
+        font-family: 'Inter', sans-serif !important;
+    }
+    /* Placeholder más suave */
+    div[data-baseweb="input"] input::placeholder,
+    div[data-baseweb="textarea"] textarea::placeholder,
+    [data-testid="stTextInputRootElement"] input::placeholder,
+    [data-testid="stTextAreaRootElement"] textarea::placeholder {
+        color: #89A7CC !important;
+        opacity: 0.85;
     }
     div[data-baseweb="input"]:focus-within,
     div[data-baseweb="textarea"]:focus-within,
@@ -486,6 +787,42 @@ st.markdown(
     [data-testid="stDateInputField"]:focus-within,
     [data-testid="stSelectbox"] div[role="group"]:focus-within {
         border-color: var(--accent-hover) !important;
+        box-shadow: 0 0 0 2px rgba(76, 140, 240, 0.22), inset 0 1px 2px rgba(0,0,0,0.18) !important;
+    }
+
+    /* Pestañas (tabs): estilo más limpio, tipo tarjeta */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 6px;
+        background-color: rgba(11, 37, 69, 0.5);
+        padding: 6px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 10px;
+        padding: 10px 16px !important;
+        color: #A7C2E6 !important;
+        font-weight: 500;
+        font-family: 'Inter', sans-serif !important;
+    }
+    .stTabs [data-baseweb="tab"]:hover {
+        background-color: rgba(47, 111, 214, 0.18) !important;
+        color: #FFFFFF !important;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: var(--accent) !important;
+        color: #FFFFFF !important;
+        font-weight: 600;
+        box-shadow: 0 3px 8px rgba(47, 111, 214, 0.4);
+    }
+
+    /* Containers con borde: suaves y con sombra */
+    div[data-testid="stVerticalBlockBorderWrapper"] > div,
+    div[data-testid="stContainer"] [data-testid="stVerticalBlockBorderWrapper"] {
+        border-radius: 14px !important;
+        border: 1px solid var(--border) !important;
+        background-color: rgba(22, 58, 107, 0.35) !important;
+        box-shadow: 0 3px 10px rgba(0,0,0,0.2);
     }
 
     .header-banner {
@@ -523,6 +860,16 @@ st.markdown(
         padding-bottom: 6px;
         margin-bottom: 8px;
     }
+    .kpi-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin-bottom: 8px;
+    }
+    @media (max-width: 600px) {
+        .kpi-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+        .kpi-card .kpi-value { font-size: 1.1rem; }
+    }
     .kpi-card {
         flex: 1 1 140px;
         min-width: 140px;
@@ -531,8 +878,18 @@ st.markdown(
         color: #FFFFFF;
         box-shadow: 0 6px 14px rgba(0,0,0,0.3);
     }
+    .kpi-grid .kpi-card {
+        flex: unset;
+        min-width: 0;
+    }
     .kpi-card .kpi-label { font-size: 0.75rem; opacity: 0.9; }
-    .kpi-card .kpi-value { font-size: 1.35rem; font-weight: 700; margin-top: 4px; }
+    .kpi-card .kpi-value {
+        font-size: 1.35rem;
+        font-weight: 700;
+        margin-top: 4px;
+        word-break: break-word;
+        overflow-wrap: break-word;
+    }
     .kpi-blue { background: linear-gradient(135deg, var(--navy-light), var(--accent)); }
     .kpi-green { background: linear-gradient(135deg, #0F6A4C, var(--green)); }
     .kpi-orange { background: linear-gradient(135deg, #8A5A12, var(--orange)); }
@@ -548,27 +905,116 @@ st.markdown(
         border-radius: 999px;
         font-size: 0.78rem;
     }
+
+    /* ===== Tablas: st.data_editor y st.dataframe (estilo "no-Excel", más prolijo) ===== */
+    [data-testid="stDataEditor"],
+    [data-testid="stDataFrame"] {
+        border: 1.5px solid var(--border) !important;
+        border-radius: 14px !important;
+        background-color: var(--navy-light) !important;
+        padding: 4px 4px 6px 4px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.22);
+        overflow: hidden;
+    }
+    /* Encabezados (fila superior) */
+    [data-testid="stDataEditor"] [data-testid="stTableStyledTableHeader"],
+    [data-testid="stDataFrame"] [data-testid="stTableStyledTableHeader"],
+    [data-testid="stDataEditor"] .glideDataEditor .dvn-scroller .gde-header,
+    [data-testid="stDataFrame"] .glideDataEditor .dvn-scroller .gde-header {
+        background: linear-gradient(180deg, #1F4A83, #12335E) !important;
+        color: #FFFFFF !important;
+        font-weight: 700 !important;
+        font-size: 0.95rem !important;
+        border-bottom: 2px solid var(--accent) !important;
+    }
+    /* Celdas: altura, padding y bordes suaves */
+    [data-testid="stDataEditor"] .glideDataEditor .dvn-scroller,
+    [data-testid="stDataFrame"] .glideDataEditor .dvn-scroller,
+    [data-testid="stDataEditor"] [data-testid="stTableStyledTableCellContent"],
+    [data-testid="stDataFrame"] [data-testid="stTableStyledTableCellContent"] {
+        font-family: 'Inter', sans-serif !important;
+        font-size: 0.92rem !important;
+    }
+    /* Filas alternadas para no perder de vista la línea */
+    [data-testid="stDataEditor"] .gdt-Row:nth-child(even),
+    [data-testid="stDataFrame"] .gdt-Row:nth-child(even) {
+        background-color: rgba(47, 111, 214, 0.08) !important;
+    }
+    [data-testid="stDataEditor"] .gdt-Row:hover,
+    [data-testid="stDataFrame"] .gdt-Row:hover {
+        background-color: rgba(76, 140, 240, 0.14) !important;
+    }
+    /* Bordes interiores entre celdas */
+    [data-testid="stDataEditor"] .gdt-Cell,
+    [data-testid="stDataFrame"] .gdt-Cell {
+        border-bottom: 1px solid rgba(88, 124, 173, 0.35) !important;
+        border-right: 1px solid rgba(88, 124, 173, 0.25) !important;
+        padding: 6px 10px !important;
+        min-height: 44px !important;
+    }
+    /* Celda seleccionada (borde azul fuerte y claro) */
+    [data-testid="stDataEditor"] .gdt-Cell[aria-selected="true"],
+    [data-testid="stDataFrame"] .gdt-Cell[aria-selected="true"],
+    [data-testid="stDataEditor"] .gde-selected,
+    [data-testid="stDataFrame"] .gde-selected {
+        outline: 2px solid var(--accent-hover) !important;
+        outline-offset: -2px;
+        background-color: rgba(47, 111, 214, 0.18) !important;
+        border-radius: 4px;
+    }
+    /* Inputs DENTRO de la tabla cuando estás editando */
+    [data-testid="stDataEditor"] input,
+    [data-testid="stDataEditor"] textarea,
+    [data-testid="stDataEditor"] select {
+        border-radius: 8px !important;
+        padding: 6px 10px !important;
+    }
+    /* Scrollbar más limpio dentro de tablas */
+    [data-testid="stDataEditor"] .dvn-scroll-inner::-webkit-scrollbar,
+    [data-testid="stDataFrame"] .dvn-scroll-inner::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+    }
+    [data-testid="stDataEditor"] .dvn-scroll-inner::-webkit-scrollbar-thumb,
+    [data-testid="stDataFrame"] .dvn-scroll-inner::-webkit-scrollbar-thumb {
+        background: #2A5A9A;
+        border-radius: 999px;
+    }
+    [data-testid="stDataEditor"] .dvn-scroll-inner::-webkit-scrollbar-track,
+    [data-testid="stDataFrame"] .dvn-scroll-inner::-webkit-scrollbar-track {
+        background: rgba(11, 37, 69, 0.6);
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ============================================================
-# ESTADO INICIAL DE LA SESIÓN
+# BARRA LATERAL: CÓDIGO PERSONAL (OPCIONAL)
 # ============================================================
-if "lista_items" not in st.session_state:
-    st.session_state.lista_items = []
+with st.sidebar:
+    st.subheader("Guardar o recuperar tus datos")
+    st.caption(
+        "Opcional. Podés usar la app sin código. Si querés recuperar tus presupuestos "
+        "desde otro dispositivo, elegí un código fácil de recordar."
+    )
+    st.write("Código de esta sesión:")
+    st.code(st.session_state.codigo, language=None)
 
-if "empresa" not in st.session_state:
-    st.session_state.empresa = cargar_config()
+    st.text_input("Código personal (ej: juan2026)", key="codigo_input")
+    st.button("Usar este código", on_click=aplicar_codigo, width="stretch")
 
-if "pdf_actual" not in st.session_state:
-    st.session_state.pdf_actual = None
+    aviso_codigo = st.session_state.pop("aviso_codigo", None)
+    if aviso_codigo:
+        tipo, texto = aviso_codigo
+        {"ok": st.success, "error": st.error, "info": st.info}[tipo](texto)
 
-if "reset_counter" not in st.session_state:
-    st.session_state.reset_counter = 0
+    st.caption("El código no es una contraseña: cualquiera que lo conozca puede ver esos datos.")
 
 
+# ============================================================
+# ENCABEZADO
+# ============================================================
 def mostrar_banner():
     empresa = st.session_state.empresa
     logo_uri = logo_base64_uri(empresa.get("logo_path", ""))
@@ -583,96 +1029,41 @@ mostrar_banner()
 
 st.info(
     "Versión de prueba: usá datos de ejemplo, no de clientes reales. "
-    "Tu código no es una contraseña y los datos podrían borrarse si el servidor se reinicia."
+    "Tus datos quedan asociados al enlace de esta página (guardala en favoritos) y podrían "
+    "borrarse si el servidor se reinicia."
 )
 if URL_FORMULARIO_OPINION:
-    st.link_button("Dejar mi opinión (2 minutos)", URL_FORMULARIO_OPINION, use_container_width=True)
+    st.link_button("Dejar mi opinión (2 minutos)", URL_FORMULARIO_OPINION, width="stretch")
 
-tab_panel, tab_nuevo, tab_personalizar, tab_historial, tab_pro = st.tabs(
-    ["Panel", "Nuevo Presupuesto", "Personalizar Factura", "Historial", "Plan Pro"]
+# "Nuevo Presupuesto" va primero para que sea lo que se ve al entrar.
+tab_nuevo, tab_panel, tab_config, tab_historial, tab_pro = st.tabs(
+    ["Nuevo Presupuesto", "Panel", "Configuración del Negocio", "Historial", "Plan Pro"]
 )
 
 # ------------------------------------------------------------
-# TAB 0: PANEL (dashboard con pandas + plotly)
-# ------------------------------------------------------------
-with tab_panel:
-    historial_panel = cargar_historial()
-
-    if not historial_panel:
-        st.info("Todavía no generaste ningún presupuesto. Los indicadores van a aparecer acá a medida que cargues datos.")
-    else:
-        df_hist = construir_dataframe_historial(historial_panel)
-        df_items = construir_dataframe_items(historial_panel)
-
-        mes_actual = date.today().strftime("%Y-%m")
-        total_historico = df_hist["total"].sum()
-        total_mes = df_hist.loc[df_hist["mes"] == mes_actual, "total"].sum()
-        cantidad_pendientes = int((df_hist["estado"] == "Pendiente").sum())
-        cantidad_aprobados = int((df_hist["estado"] == "Aprobado").sum())
-
-        cards_html = (
-            '<div class="kpi-row">'
-            + kpi_card("Facturado histórico", f"$ {total_historico:,.0f}", "kpi-blue")
-            + kpi_card("Facturado este mes", f"$ {total_mes:,.0f}", "kpi-green")
-            + kpi_card("Pendientes", str(cantidad_pendientes), "kpi-orange")
-            + kpi_card("Aprobados", str(cantidad_aprobados), "kpi-green")
-            + "</div>"
-        )
-        st.markdown(cards_html, unsafe_allow_html=True)
-
-        st.write("")
-        st.subheader("Facturación por mes")
-        df_mensual = df_hist.groupby("mes", as_index=False)["total"].sum().sort_values("mes")
-        fig_mensual = px.bar(df_mensual, x="mes", y="total", labels={"mes": "Mes", "total": "Total facturado"})
-        fig_mensual.update_traces(marker_color="#2F6FD6")
-        fig_mensual.update_xaxes(type="category")
-        st.plotly_chart(estilizar_grafico(fig_mensual), use_container_width=True)
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.subheader("Por estado")
-            df_estado = df_hist.groupby("estado", as_index=False).size().rename(columns={"size": "cantidad"})
-            fig_estado = px.pie(
-                df_estado, names="estado", values="cantidad", hole=0.55,
-                color_discrete_sequence=PALETA_GRAFICOS,
-            )
-            st.plotly_chart(estilizar_grafico(fig_estado), use_container_width=True)
-
-        with col_b:
-            st.subheader("Por categoría")
-            if not df_items.empty:
-                df_categoria = (
-                    df_items.groupby("categoria", as_index=False)["subtotal"]
-                    .sum()
-                    .sort_values("subtotal", ascending=True)
-                )
-                fig_categoria = px.bar(
-                    df_categoria, x="subtotal", y="categoria", orientation="h",
-                    color_discrete_sequence=PALETA_GRAFICOS,
-                    labels={"subtotal": "Total", "categoria": ""},
-                )
-                st.plotly_chart(estilizar_grafico(fig_categoria), use_container_width=True)
-
-        st.subheader("Top clientes")
-        df_top_clientes = (
-            df_hist.groupby("cliente", as_index=False)["total"]
-            .sum()
-            .sort_values("total", ascending=False)
-            .head(5)
-            .rename(columns={"cliente": "Cliente", "total": "Total facturado"})
-        )
-        st.dataframe(df_top_clientes, use_container_width=True, hide_index=True)
-
-# ------------------------------------------------------------
-# TAB 1: NUEVO PRESUPUESTO
+# TAB 0: NUEVO PRESUPUESTO
 # ------------------------------------------------------------
 with tab_nuevo:
+    # --- Rubro / Actividad: visible de entrada, arriba de todo ---
+    opciones_rubro = list(RUBROS.keys())
+    rubro_guardado = st.session_state.empresa.get("rubro", "Aire Acondicionado")
+    st.selectbox(
+        "Rubro / Actividad",
+        opciones_rubro,
+        index=opciones_rubro.index(rubro_guardado) if rubro_guardado in opciones_rubro else 0,
+        key="rubro_selector",
+        on_change=al_cambiar_rubro,
+        help="Cambia las categorías y los servicios predefinidos disponibles.",
+    )
+
     rubro_actual = st.session_state.empresa.get("rubro", "Aire Acondicionado")
-    config_rubro = RUBROS.get(rubro_actual, RUBROS["Otro / Personalizado"])
+    config_rubro = config_del_rubro(rubro_actual)
     categorias_actuales = config_rubro["categorias"]
     servicios_actuales = config_rubro["servicios"]
 
-    st.caption(f"Rubro actual: {rubro_actual} (se cambia en \"Personalizar Factura\")")
+    # Si la categoría guardada ya no pertenece al rubro, vuelve a la primera.
+    if st.session_state.get("item_categoria") not in categorias_actuales:
+        st.session_state.item_categoria = categorias_actuales[0]
 
     st.subheader("Datos del Cliente")
     cliente_nombre = st.text_input("Nombre y Apellido", key="cliente_nombre_input")
@@ -681,70 +1072,81 @@ with tab_nuevo:
         cliente_direccion = st.text_input("Dirección / Ubicación", key="cliente_direccion_input")
     with col2:
         cliente_telefono = st.text_input("Teléfono del cliente", key="cliente_telefono_input")
-    fecha = st.date_input("Fecha", value=date.today())
+
+    # N° de presupuesto: viene prellenado con el siguiente, pero se puede
+    # editar para llevar una secuencia propia. La clave incluye el número
+    # sugerido: cuando se guarda un presupuesto, el campo se vuelve a prellenar.
+    historial_actual = cargar_historial()
+    numero_sugerido = siguiente_id(historial_actual)
+    col_num, col_fecha = st.columns(2)
+    with col_num:
+        numero_presupuesto = st.number_input(
+            "N° de presupuesto",
+            min_value=1,
+            max_value=999999,
+            value=numero_sugerido,
+            step=1,
+            key=f"numero_presupuesto_{numero_sugerido}",
+            help="Se completa solo con el siguiente número, pero podés cambiarlo.",
+        )
+    with col_fecha:
+        fecha = st.date_input("Fecha", value=date.today())
 
     st.divider()
     st.subheader("Detalle del Trabajo")
 
-    opciones_serv = ["Personalizado..."] + [s["descripcion"] for s in servicios_actuales]
-    seleccion = st.selectbox("Servicio predefinido (opcional)", opciones_serv)
-    servicio_sugerido = next((s for s in servicios_actuales if s["descripcion"] == seleccion), None)
+    # Al elegir un servicio, al_elegir_servicio() rellena los campos de abajo.
+    opciones_serv = [OPCION_PERSONALIZADO] + [s["descripcion"] for s in servicios_actuales]
+    if st.session_state.servicio_sel not in opciones_serv:
+        st.session_state.servicio_sel = OPCION_PERSONALIZADO
+    st.selectbox(
+        "Servicio predefinido (opcional)",
+        opciones_serv,
+        key="servicio_sel",
+        on_change=al_elegir_servicio,
+    )
 
-    with st.form("form_item", clear_on_submit=True):
-        categoria_default = servicio_sugerido["categoria"] if servicio_sugerido else categorias_actuales[0]
-        categoria = st.selectbox("Categoría", categorias_actuales, index=categorias_actuales.index(categoria_default))
-        descripcion = st.text_input(
-            "Descripción del concepto",
-            value=servicio_sugerido["descripcion"] if servicio_sugerido else "",
-            max_chars=80,
+    st.selectbox("Categoría", categorias_actuales, key="item_categoria")
+    st.text_input("Descripción del concepto", key="item_descripcion", max_chars=80)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.number_input("Cantidad", min_value=1, max_value=50, step=1, key="item_cantidad")
+    with col2:
+        st.number_input(
+            "Precio unitario ($)",
+            min_value=0.0,
+            max_value=100000000.0,
+            step=100.0,
+            format="%.2f",
+            key="item_precio",
         )
-        col1, col2 = st.columns(2)
-        with col1:
-            cantidad = st.number_input("Cantidad", min_value=1, max_value=50, value=1, step=1)
-        with col2:
-            precio_unitario = st.number_input(
-                "Precio unitario ($)",
-                min_value=0.0,
-                max_value=100000000.0,
-                value=float(servicio_sugerido["precio"]) if servicio_sugerido else 0.0,
-                step=100.0,
-                format="%.2f",
-            )
-        agregar = st.form_submit_button("Agregar ítem")
+    st.button("Agregar ítem", on_click=agregar_item, width="stretch")
 
-        if agregar:
-            if not descripcion.strip():
-                st.error("La descripción no puede estar vacía.")
-            elif precio_unitario <= 0:
-                st.error("El precio unitario debe ser mayor a 0.")
-            else:
-                st.session_state.lista_items.append(
-                    {
-                        "categoria": categoria,
-                        "descripcion": descripcion.strip(),
-                        "cantidad": cantidad,
-                        "precio_unitario": precio_unitario,
-                        "subtotal": cantidad * precio_unitario,
-                    }
-                )
-                st.success("Ítem agregado.")
+    aviso_item = st.session_state.pop("aviso_item", None)
+    if aviso_item:
+        tipo, texto = aviso_item
+        (st.success if tipo == "ok" else st.error)(texto)
 
+    # --- Adicionales rápidos (se editan en "Configuración del Negocio") ---
     st.caption("Adicionales rápidos")
-    cols_add = st.columns(len(ADICIONALES_RAPIDOS_GENERICOS))
-    for c, ad in zip(cols_add, ADICIONALES_RAPIDOS_GENERICOS):
-        with c:
-            if st.button(ad["descripcion"], key=f"add_{ad['descripcion']}", use_container_width=True):
-                st.session_state.lista_items.append(
-                    {
-                        "categoria": ad["categoria"],
-                        "descripcion": ad["descripcion"],
-                        "cantidad": 1,
-                        "precio_unitario": ad["precio"],
-                        "subtotal": ad["precio"],
-                    }
-                )
-                st.rerun()
+    adicionales = st.session_state.empresa.get("adicionales", [])
+    if adicionales:
+        # Se acomodan de a 3 por fila, sin importar cuántos haya.
+        for inicio in range(0, len(adicionales), 3):
+            fila = adicionales[inicio:inicio + 3]
+            for offset, (col, ad) in enumerate(zip(st.columns(len(fila)), fila)):
+                with col:
+                    st.button(
+                        ad["descripcion"],
+                        key=f"add_rapido_{inicio + offset}",
+                        on_click=agregar_adicional,
+                        args=(ad,),
+                        width="stretch",
+                    )
+    else:
+        st.caption('No hay adicionales cargados. Podés crearlos en "Configuración del Negocio".')
 
+    # --- Tabla editable de ítems ---
     st.write("Ítems del presupuesto (editable directamente en la tabla)")
     columnas_items = ["categoria", "descripcion", "cantidad", "precio_unitario", "subtotal"]
     if st.session_state.lista_items:
@@ -752,27 +1154,69 @@ with tab_nuevo:
     else:
         df_items_edit = pd.DataFrame(columns=columnas_items)
 
+    # Si hay ítems de otro rubro (ej: se cambió el rubro a mitad de presupuesto),
+    # sus categorías se suman a las opciones para que la tabla no las pierda.
+    categorias_en_uso = {i["categoria"] for i in st.session_state.lista_items}
+    opciones_categoria = categorias_actuales + sorted(c for c in categorias_en_uso if c not in categorias_actuales)
+
+    # Anchos fijos adaptados: descripción y categoría con más espacio,
+    # cantidad angosta, precios con ancho suficiente para no cortar.
     edited_df = st.data_editor(
         df_items_edit,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         key=f"editor_items_{st.session_state.reset_counter}",
         column_config={
-            "categoria": st.column_config.SelectboxColumn("Categoría", options=categorias_actuales),
-            "descripcion": st.column_config.TextColumn("Descripción", width="large"),
-            "cantidad": st.column_config.NumberColumn("Cant.", min_value=1, step=1),
-            "precio_unitario": st.column_config.NumberColumn("P. Unit.", min_value=0.0, format="$ %.2f"),
-            "subtotal": st.column_config.NumberColumn("Subtotal", format="$ %.2f", disabled=True),
+            "categoria": st.column_config.SelectboxColumn(
+                "Categoría", options=opciones_categoria, width="medium", required=True,
+            ),
+            "descripcion": st.column_config.TextColumn(
+                "Descripción", width="large", required=True, max_chars=100,
+            ),
+            "cantidad": st.column_config.NumberColumn(
+                "Cant.", min_value=1, step=1, width="small", required=True,
+            ),
+            "precio_unitario": st.column_config.NumberColumn(
+                "P. Unitario ($)", min_value=0.0, format="$ %.2f", width="medium", required=True,
+            ),
+            "subtotal": st.column_config.NumberColumn(
+                "Subtotal", format="$ %.2f", disabled=True, width="medium",
+            ),
         },
     )
 
-    edited_df["cantidad"] = edited_df["cantidad"].fillna(1)
-    edited_df["precio_unitario"] = edited_df["precio_unitario"].fillna(0.0)
+    # Se completan los vacíos (filas nuevas) y se recalcula el subtotal.
+    edited_df["cantidad"] = pd.to_numeric(edited_df["cantidad"], errors="coerce").fillna(1).clip(lower=1).astype(int)
+    edited_df["precio_unitario"] = pd.to_numeric(edited_df["precio_unitario"], errors="coerce").fillna(0.0)
     edited_df["subtotal"] = edited_df["cantidad"] * edited_df["precio_unitario"]
-    edited_df["categoria"] = edited_df["categoria"].fillna(categorias_actuales[0])
-    edited_df["descripcion"] = edited_df["descripcion"].fillna("")
+    edited_df["categoria"] = edited_df["categoria"].fillna(categorias_actuales[0]).replace({"None": categorias_actuales[0], None: categorias_actuales[0]})
+    edited_df["descripcion"] = edited_df["descripcion"].fillna("").replace({"None": "", None: ""}).astype(str)
+    edited_df["descripcion"] = edited_df["descripcion"].str.strip()
     st.session_state.lista_items = edited_df.to_dict("records")
+
+    # Botones de limpieza / eliminación de filas (por si agregaste filas sin querer)
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        st.button(
+            "🧹 Quitar filas vacías",
+            on_click=eliminar_filas_vacias,
+            width="stretch",
+            help="Elimina las filas que tienen descripción vacía o precio 0.",
+            disabled=not st.session_state.lista_items,
+        )
+    with col_btn2:
+        st.button(
+            "🗑️ Limpiar todos los ítems",
+            on_click=limpiar_items,
+            width="stretch",
+            help="Borra TODOS los ítems de la lista (no se puede deshacer).",
+            disabled=not st.session_state.lista_items,
+        )
+    st.caption(
+        "Tip: en la tabla también podés seleccionar una fila y apretar la tecla Supr/Delete "
+        "para borrarla directamente."
+    )
 
     # Resumen por categoría hecho "a mano" con un diccionario común.
     # (En la pestaña Panel hacemos lo mismo con pandas groupby, que
@@ -805,38 +1249,60 @@ with tab_nuevo:
         "No incluye materiales no especificados.\n"
         "Garantía del trabajo realizado: 6 meses."
     )
-    notas = st.text_area("Notas / Condiciones", value=notas_default, height=100)
+    notas = st.text_area(
+        "Notas / Condiciones",
+        value=notas_default,
+        height=100,
+        max_chars=MAX_CHARS_NOTAS,
+        help=f"Máximo {MAX_CHARS_NOTAS} caracteres, para que el PDF quede prolijo.",
+    )
 
     subtotal = sum(i["subtotal"] for i in st.session_state.lista_items)
     descuento_monto = subtotal * (descuento_pct / 100)
     total = subtotal - descuento_monto + envio
 
     st.divider()
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Subtotal", f"$ {subtotal:,.2f}")
-    with col2:
-        st.metric("Descuento", f"$ {descuento_monto:,.2f}")
-    with col3:
-        st.metric("Envío", f"$ {envio:,.2f}")
-    with col4:
-        st.metric("Total", f"$ {total:,.2f}")
+    metrics_html = (
+        '<div class="kpi-grid">'
+        + kpi_card("Subtotal", f"$ {subtotal:,.2f}", "kpi-blue")
+        + kpi_card("Descuento", f"$ {descuento_monto:,.2f}", "kpi-orange")
+        + kpi_card("Envío", f"$ {envio:,.2f}", "kpi-green")
+        + kpi_card("Total Cotizado", f"$ {total:,.2f}", "kpi-red")
+        + "</div>"
+    )
+    st.markdown(metrics_html, unsafe_allow_html=True)
 
     st.divider()
 
-    if st.button("Generar PDF", type="primary", use_container_width=True):
+    if st.button("Generar PDF", type="primary", width="stretch"):
         errores = []
         if not cliente_nombre.strip():
             errores.append("Falta el nombre del cliente.")
         if not st.session_state.lista_items:
             errores.append("Agregá al menos un ítem al presupuesto.")
+        elif any(not str(i["descripcion"]).strip() for i in st.session_state.lista_items):
+            errores.append("Hay ítems sin descripción: completalos o borrá esas filas.")
+
+        historial = cargar_historial()
+        nuevo_id = int(numero_presupuesto)
+        if any(p["id"] == nuevo_id for p in historial):
+            errores.append(f"Ya existe el presupuesto N° {nuevo_id:04d}. Elegí otro número.")
 
         if errores:
             for e in errores:
                 st.error(e)
         else:
-            historial = cargar_historial()
-            nuevo_id = siguiente_id(historial)
+            # Se guardan tipos simples de Python (int/float/str) para que el JSON no falle.
+            items_limpios = [
+                {
+                    "categoria": str(i["categoria"]),
+                    "descripcion": str(i["descripcion"]).strip(),
+                    "cantidad": int(i["cantidad"]),
+                    "precio_unitario": float(i["precio_unitario"]),
+                    "subtotal": float(i["subtotal"]),
+                }
+                for i in st.session_state.lista_items
+            ]
 
             presupuesto = {
                 "id": nuevo_id,
@@ -844,13 +1310,13 @@ with tab_nuevo:
                 "cliente_nombre": cliente_nombre.strip(),
                 "cliente_direccion": cliente_direccion.strip(),
                 "cliente_telefono": cliente_telefono.strip(),
-                "items": st.session_state.lista_items,
-                "subtotal": subtotal,
-                "descuento_pct": descuento_pct,
-                "descuento_monto": descuento_monto,
-                "envio": envio,
-                "total": total,
-                "notas": notas.strip(),
+                "items": items_limpios,
+                "subtotal": float(subtotal),
+                "descuento_pct": float(descuento_pct),
+                "descuento_monto": float(descuento_monto),
+                "envio": float(envio),
+                "total": float(total),
+                "notas": limpiar_notas(notas),
                 "estado": estado,
             }
 
@@ -870,12 +1336,20 @@ with tab_nuevo:
                 )
                 st.session_state.pdf_actual_info = {
                     "cliente": cliente_nombre.strip(),
+                    "cliente_telefono": cliente_telefono.strip(),
                     "total": total,
                     "id": nuevo_id,
                 }
                 st.session_state.lista_items = []
                 st.session_state.reset_counter += 1
-                st.success(f"Presupuesto N° {nuevo_id:04d} generado y guardado.")
+                # Se guarda el aviso y se recarga: así el campo "N° de presupuesto"
+                # ya muestra el número siguiente. El aviso se muestra tras el botón.
+                st.session_state.aviso_generado = f"Presupuesto N° {nuevo_id:04d} generado y guardado."
+                st.rerun()
+
+    aviso_generado = st.session_state.pop("aviso_generado", None)
+    if aviso_generado:
+        st.success(aviso_generado)
 
     if st.session_state.get("pdf_actual"):
         info = st.session_state.pdf_actual_info
@@ -884,48 +1358,105 @@ with tab_nuevo:
             data=st.session_state.pdf_actual,
             file_name=st.session_state.pdf_actual_nombre,
             mime="application/pdf",
-            use_container_width=True,
+            width="stretch",
             key="descarga_pdf_actual",
         )
 
-        with st.expander("Vista previa del PDF"):
-            b64_pdf = base64.b64encode(st.session_state.pdf_actual).decode()
-            components.html(
-                f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="500" '
-                f'style="border:none;"></iframe>',
-                height=520,
-            )
-
-        telefono_wa = st.session_state.empresa.get("whatsapp", "").strip()
-        if telefono_wa:
+        telefono_cliente_wa = limpiar_telefono(st.session_state.get("pdf_actual_info", {}).get("cliente_telefono", ""))
+        if telefono_cliente_wa:
             mensaje = (
                 f"Hola {info['cliente']}, te comparto el presupuesto N° {info['id']:04d} "
                 f"por un total de $ {info['total']:,.2f}. Cualquier consulta quedo a disposición."
             )
-            wa_url = f"https://wa.me/{telefono_wa}?text={quote(mensaje)}"
+            wa_url = f"https://wa.me/{telefono_cliente_wa}?text={quote(mensaje)}"
             st.markdown(
                 f'<a href="{wa_url}" target="_blank" class="wa-button">Enviar aviso por WhatsApp</a>',
                 unsafe_allow_html=True,
             )
+            st.caption("El mensaje se envía al teléfono del cliente cargado en Datos del Cliente.")
         else:
-            st.caption('Cargá un número de WhatsApp en "Personalizar Factura" para enviar el aviso directo.')
+            st.caption("Para enviar el aviso por WhatsApp, cargá el teléfono del cliente en la sección Datos del Cliente.")
 
 # ------------------------------------------------------------
-# TAB 2: PERSONALIZAR FACTURA
+# TAB 1: PANEL (dashboard con pandas + plotly)
 # ------------------------------------------------------------
-with tab_personalizar:
-    st.subheader("Datos de la Empresa")
+with tab_panel:
+    historial_panel = cargar_historial()
+
+    if not historial_panel:
+        st.info("Todavía no generaste ningún presupuesto. Los indicadores van a aparecer acá a medida que cargues datos.")
+    else:
+        df_hist = construir_dataframe_historial(historial_panel)
+        df_items = construir_dataframe_items(historial_panel)
+
+        mes_actual = date.today().strftime("%Y-%m")
+        total_historico = df_hist["total"].sum()
+        total_mes = df_hist.loc[df_hist["mes"] == mes_actual, "total"].sum()
+        cantidad_pendientes = int((df_hist["estado"] == "Pendiente").sum())
+        cantidad_aprobados = int((df_hist["estado"] == "Aprobado").sum())
+
+        cards_html = (
+            '<div class="kpi-row">'
+            + kpi_card("Total cotizado histórico", f"$ {total_historico:,.0f}", "kpi-blue")
+            + kpi_card("Cotizado este mes", f"$ {total_mes:,.0f}", "kpi-green")
+            + kpi_card("Pendientes", str(cantidad_pendientes), "kpi-orange")
+            + kpi_card("Aprobados", str(cantidad_aprobados), "kpi-green")
+            + "</div>"
+        )
+        st.markdown(cards_html, unsafe_allow_html=True)
+
+        st.write("")
+        st.subheader("Presupuestado por mes")
+        df_mensual = df_hist.groupby("mes", as_index=False)["total"].sum().sort_values("mes")
+        fig_mensual = px.bar(df_mensual, x="mes", y="total", labels={"mes": "Mes", "total": "Total presupuestado"})
+        fig_mensual.update_traces(marker_color="#2F6FD6")
+        fig_mensual.update_xaxes(type="category")
+        st.plotly_chart(estilizar_grafico(fig_mensual), width="stretch", config=CONFIG_PLOTLY)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.subheader("Por estado")
+            df_estado = df_hist.groupby("estado", as_index=False).size().rename(columns={"size": "cantidad"})
+            fig_estado = px.pie(
+                df_estado, names="estado", values="cantidad", hole=0.55,
+                color_discrete_sequence=PALETA_GRAFICOS,
+            )
+            st.plotly_chart(estilizar_grafico(fig_estado), width="stretch", config=CONFIG_PLOTLY)
+
+        with col_b:
+            st.subheader("Por categoría")
+            if not df_items.empty:
+                df_categoria = (
+                    df_items.groupby("categoria", as_index=False)["subtotal"]
+                    .sum()
+                    .sort_values("subtotal", ascending=True)
+                )
+                fig_categoria = px.bar(
+                    df_categoria, x="subtotal", y="categoria", orientation="h",
+                    color_discrete_sequence=PALETA_GRAFICOS,
+                    labels={"subtotal": "Total", "categoria": ""},
+                )
+                st.plotly_chart(estilizar_grafico(fig_categoria), width="stretch", config=CONFIG_PLOTLY)
+
+        st.subheader("Top clientes")
+        df_top_clientes = (
+            df_hist.groupby("cliente", as_index=False)["total"]
+            .sum()
+            .sort_values("total", ascending=False)
+            .head(5)
+            .rename(columns={"cliente": "Cliente", "total": "Total presupuestado"})
+        )
+        st.dataframe(df_top_clientes, width="stretch", hide_index=True)
+
+# ------------------------------------------------------------
+# TAB 2: CONFIGURACIÓN DEL NEGOCIO
+# ------------------------------------------------------------
+with tab_config:
+    st.subheader("Datos del Negocio")
     empresa = st.session_state.empresa
 
     nombre_emp = st.text_input("Nombre / Marca", value=empresa.get("nombre", ""))
-
-    opciones_rubro = list(RUBROS.keys())
-    rubro_guardado = empresa.get("rubro", "Aire Acondicionado")
-    rubro_emp = st.selectbox(
-        "Rubro / Actividad",
-        opciones_rubro,
-        index=opciones_rubro.index(rubro_guardado) if rubro_guardado in opciones_rubro else 0,
-    )
+    st.caption('El rubro se elige arriba de todo, en la pestaña "Nuevo Presupuesto".')
 
     col1, col2 = st.columns(2)
     with col1:
@@ -952,27 +1483,62 @@ with tab_personalizar:
         placeholder="Ej: Juan Pérez - Técnico Matriculado",
     )
 
-    st.subheader("Logo de la Empresa")
+    st.subheader("Adicionales rápidos")
+    st.caption(
+        "Son los botones de un clic de la pestaña \"Nuevo Presupuesto\". "
+        "Editá las celdas, agregá filas al final o borrá las que no uses."
+    )
+    adicionales_guardados = empresa.get("adicionales", ADICIONALES_RAPIDOS_GENERICOS)
+    df_adicionales = pd.DataFrame(
+        [{"descripcion": a["descripcion"], "precio": float(a["precio"])} for a in adicionales_guardados],
+        columns=["descripcion", "precio"],
+    )
+    adicionales_editados = st.data_editor(
+        df_adicionales,
+        num_rows="dynamic",
+        width="stretch",
+        hide_index=True,
+        key=f"editor_adicionales_{st.session_state.reset_counter}",
+        column_config={
+            "descripcion": st.column_config.TextColumn(
+                "Descripción", max_chars=80, width="large", required=True,
+            ),
+            "precio": st.column_config.NumberColumn(
+                "Precio ($)", min_value=0.0, format="$ %.2f", width="medium", required=True,
+            ),
+        },
+    )
+
+    st.subheader("Logo del Negocio")
     logo_actual = empresa.get("logo_path", "")
     if logo_actual and os.path.exists(logo_actual):
         st.image(logo_actual, width=140, caption="Logo actual")
     logo_nuevo = st.file_uploader("Subir logo (PNG o JPG)", type=["png", "jpg", "jpeg"])
 
-    if st.button("Guardar cambios", type="primary", use_container_width=True):
+    if st.button("Guardar cambios", type="primary", width="stretch"):
         empresa["nombre"] = nombre_emp.strip()
-        empresa["rubro"] = rubro_emp
         empresa["telefono"] = telefono_emp.strip()
         empresa["zona"] = zona_emp.strip()
         empresa["whatsapp"] = whatsapp_emp.strip()
         empresa["validez_dias"] = validez_emp
         empresa["firma_texto"] = firma_emp.strip()
 
+        # Se descartan las filas sin descripción; precio vacío = 0.
+        adicionales_nuevos = []
+        for _, fila in adicionales_editados.iterrows():
+            descripcion_ad = str(fila["descripcion"]).strip() if pd.notna(fila["descripcion"]) else ""
+            precio_ad = float(fila["precio"]) if pd.notna(fila["precio"]) else 0.0
+            if descripcion_ad:
+                adicionales_nuevos.append({"categoria": "Otro", "descripcion": descripcion_ad, "precio": precio_ad})
+        empresa["adicionales"] = adicionales_nuevos
+
         if logo_nuevo is not None:
             empresa["logo_path"] = guardar_logo(logo_nuevo)
 
         st.session_state.empresa = empresa
         guardar_config(empresa)
-        st.success("Datos de la empresa actualizados.")
+        st.session_state.reset_counter += 1  # refresca las tablas editables
+        st.success("Datos del negocio actualizados.")
         st.rerun()
 
 # ------------------------------------------------------------
@@ -1024,7 +1590,7 @@ with tab_historial:
         for p in filtrados:
             with st.container(border=True):
                 st.write(f"N° {p['id']:04d} — {p['cliente_nombre']}")
-                st.write(f"{p['fecha']}  |  $ {p['total']:,.2f}  |  {p.get('estado', 'Pendiente')}")
+                st.write(f"{p['fecha']}  |  {dinero(p['total'])}  |  {p.get('estado', 'Pendiente')}")
 
                 col1, col2, col3 = st.columns(3)
                 with col1:
@@ -1056,20 +1622,34 @@ with tab_historial:
                         st.error(f"No se pudo generar el PDF: {e}")
 
                 with col3:
-                    if st.button("Duplicar", key=f"dup_{p['id']}", use_container_width=True):
-                        st.session_state.cliente_nombre_input = p["cliente_nombre"]
-                        st.session_state.cliente_direccion_input = p["cliente_direccion"]
-                        st.session_state.cliente_telefono_input = p["cliente_telefono"]
-                        st.session_state.lista_items = [dict(item) for item in p["items"]]
-                        st.session_state.reset_counter += 1
-                        st.success('Datos copiados. Andá a la pestaña "Nuevo Presupuesto".')
+                    st.button(
+                        "Duplicar",
+                        key=f"dup_{p['id']}",
+                        on_click=duplicar_presupuesto,
+                        args=(p,),
+                        width="stretch",
+                    )
 
                 with st.expander("Ver ítems"):
                     for item in p["items"]:
                         st.write(
-                            f"- {item['descripcion']} — {item['cantidad']} x "
-                            f"$ {item['precio_unitario']:,.2f} = $ {item['subtotal']:,.2f}"
+                            f"- {item['descripcion']} — {item['cantidad']:g} x "
+                            f"{dinero(item['precio_unitario'])} = {dinero(item['subtotal'])}"
                         )
+
+                    # Desglose explícito: el Total coincide con Subtotal - Descuento + Envío.
+                    # (.get con valor por defecto: sirve también para presupuestos viejos).
+                    subtotal_h = p.get("subtotal", sum(i["subtotal"] for i in p["items"]))
+                    descuento_pct_h = p.get("descuento_pct", 0)
+                    descuento_h = p.get("descuento_monto", 0.0)
+                    envio_h = p.get("envio", 0.0)
+
+                    st.divider()
+                    st.write(f"Subtotal: {dinero(subtotal_h)}")
+                    st.write(f"Descuento ({descuento_pct_h:g}%): -{dinero(descuento_h)}")
+                    st.write(f"Envío / Desplazamiento: {dinero(envio_h)}")
+                    st.write(f"**Total: {dinero(p['total'])}**")
+
                     if p.get("notas"):
                         st.caption(p["notas"])
 
@@ -1091,13 +1671,13 @@ with tab_pro:
                 "- Presupuestos en PDF\n"
                 "- Historial y panel de métricas\n"
                 "- Tu logo y tus datos\n"
-                "- Marca \"Hecho con Paperlit\" en el PDF"
+                "- Marca \"Hecho con Presupify\" en el PDF"
             )
     with col_pro:
         with st.container(border=True):
             st.markdown("**Pro (en estudio)**")
             st.markdown(
-                "- PDF sin la marca de Paperlit\n"
+                "- PDF sin la marca de Presupify\n"
                 "- Presupuestos ilimitados\n"
                 "- Cuenta con contraseña y datos guardados\n"
                 "- Soporte por WhatsApp"
@@ -1105,6 +1685,6 @@ with tab_pro:
 
     st.write("")
     if URL_FORMULARIO_PRO:
-        st.link_button("Quiero probar el Plan Pro", URL_FORMULARIO_PRO, type="primary", use_container_width=True)
+        st.link_button("Quiero probar el Plan Pro", URL_FORMULARIO_PRO, type="primary", width="stretch")
     else:
         st.caption("Pronto vas a poder anotarte acá.")
