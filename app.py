@@ -130,11 +130,17 @@ ADICIONALES_RAPIDOS_GENERICOS = [
 ]
 
 st.set_page_config(page_title="Gestor de Presupuestos", layout="centered")
-codigo = st.text_input("Tu código personal (inventá uno, ej: juan2026)")
+codigo_url = st.query_params.get("codigo", "")
+codigo = st.text_input(
+    "Tu código personal (inventá uno, ej: juan2026)",
+    value=codigo_url,
+    key="codigo_input",
+)
 codigo = "".join(c for c in codigo if c.isalnum()).lower()
 if len(codigo) < 4:
     st.info("Escribí un código de al menos 4 letras o números para empezar.")
     st.stop()
+st.query_params["codigo"] = codigo  # queda en el link: si la página se recarga, entra sola
 st.session_state.codigo = codigo
 
 
