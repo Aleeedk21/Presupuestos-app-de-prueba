@@ -457,19 +457,29 @@ st.markdown(
         background-color: var(--navy-light);
     }
 
-    /* Campos de texto, número, lista desplegable y fecha con borde visible */
+    /* Campos de texto, número, lista desplegable y fecha con borde visible
+       (incluye selectores para versiones nuevas y viejas de Streamlit) */
     div[data-baseweb="input"],
     div[data-baseweb="textarea"],
-    div[data-baseweb="select"] > div {
-        border: 1.5px solid #5B82BE !important;
+    div[data-baseweb="select"] > div,
+    [data-testid="stTextInputRootElement"],
+    [data-testid="stNumberInputContainer"],
+    [data-testid="stTextAreaRootElement"],
+    [data-testid="stDateInputField"],
+    [data-testid="stSelectbox"] div[role="group"] {
+        border: 2px solid #5B82BE !important;
         border-radius: 10px !important;
         background-color: rgba(11, 37, 69, 0.55) !important;
     }
     div[data-baseweb="input"]:focus-within,
     div[data-baseweb="textarea"]:focus-within,
-    div[data-baseweb="select"] > div:focus-within {
+    div[data-baseweb="select"] > div:focus-within,
+    [data-testid="stTextInputRootElement"]:focus-within,
+    [data-testid="stNumberInputContainer"]:focus-within,
+    [data-testid="stTextAreaRootElement"]:focus-within,
+    [data-testid="stDateInputField"]:focus-within,
+    [data-testid="stSelectbox"] div[role="group"]:focus-within {
         border-color: var(--accent-hover) !important;
-        box-shadow: 0 0 0 1px var(--accent-hover);
     }
 
     .header-banner {
