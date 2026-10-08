@@ -45,6 +45,10 @@ def archivo_historial():
 def archivo_config():
     return f"datos/config_{st.session_state.codigo}.json"
 
+# Links de Google Forms (pegá acá tus links entre las comillas)
+URL_FORMULARIO_OPINION = "https://share.forms.app/garciaclima/contanos-que-te-parecio-paperlit"  # formulario de opiniones (3 preguntas)
+URL_FORMULARIO_PRO = "https://share.forms.app/garciaclima/sumate-a-la-lista-de-espera-de-paperlit-pro"      # formulario de interés en el Plan Pro (mail)
+
 NAVY_RGB = (11, 37, 69)
 PALETA_GRAFICOS = ["#2F6FD6", "#1FA97A", "#E0972B", "#D1445C", "#8E6FD6", "#3FB6C9"]
 
@@ -235,7 +239,7 @@ class PDFPresupuesto(FPDF):
         logo_path = self.empresa.get("logo_path", "")
         if logo_path and os.path.exists(logo_path):
             try:
-                self.image(logo_path, x=10, y=8, w=24)
+                self.image(logo_path, x=10, y=8, w=18, h=18, keep_aspect_ratio=True)
             except Exception:
                 pass
 
@@ -268,7 +272,13 @@ class PDFPresupuesto(FPDF):
         self.cell(0, 5, safe_txt(texto), ln=True, align="C")
         self.cell(0, 5, "Hecho con Paperlit - https://presupuestosclima.streamlit.app/", align="C")
 
-
+def ajustar_texto(pdf, texto, ancho):
+    texto = safe_txt(texto)
+    if pdf.get_string_width(texto) <= ancho - 2:
+        return texto
+    while texto and pdf.get_string_width(texto + "...") > ancho - 2:
+        texto = texto[:-1]
+    return texto + "..."
 def generar_pdf(presupuesto, empresa) -> bytes:
     pdf = PDFPresupuesto(empresa)
     pdf.add_page()
@@ -289,7 +299,7 @@ def generar_pdf(presupuesto, empresa) -> bytes:
     pdf.cell(0, 6, safe_txt(f"Teléfono: {presupuesto['cliente_telefono']}"), ln=True)
     pdf.ln(4)
 
-    col_widths = [90, 20, 35, 35]
+    col_widths = [85, 15, 38, 42]
     headers = ["Concepto", "Cant.", "P. Unit.", "Subtotal"]
 
     pdf.set_font("Helvetica", "B", 10)
@@ -304,7 +314,7 @@ def generar_pdf(presupuesto, empresa) -> bytes:
     fill = False
     for item in presupuesto["items"]:
         pdf.set_fill_color(240, 240, 240)
-        pdf.cell(col_widths[0], 7, safe_txt(item["descripcion"])[:55], border=1, fill=fill)
+        pdf.cell(col_widths[0], 7, ajustar_texto(pdf, item["descripcion"], col_widths[0]), border=1, fill=fill)
         pdf.cell(col_widths[1], 7, str(item["cantidad"]), border=1, align="C", fill=fill)
         pdf.cell(col_widths[2], 7, f"${item['precio_unitario']:,.2f}", border=1, align="R", fill=fill)
         pdf.cell(col_widths[3], 7, f"${item['subtotal']:,.2f}", border=1, align="R", fill=fill)
@@ -540,8 +550,15 @@ def mostrar_banner():
 
 mostrar_banner()
 
-tab_panel, tab_nuevo, tab_personalizar, tab_historial = st.tabs(
-    ["Panel", "Nuevo Presupuesto", "Personalizar Factura", "Historial"]
+st.info(
+    "Versión de prueba: usá datos de ejemplo, no de clientes reales. "
+    "Tu código no es una contraseña y los datos podrían borrarse si el servidor se reinicia."
+)
+if URL_FORMULARIO_OPINION:
+    st.link_button("Dejar mi opinión (2 minutos)", URL_FORMULARIO_OPINION, use_container_width=True)
+
+tab_panel, tab_nuevo, tab_personalizar, tab_historial, tab_pro = st.tabs(
+    ["Panel", "Nuevo Presupuesto", "Personalizar Factura", "Historial", "Plan Pro"]
 )
 
 # ------------------------------------------------------------
@@ -577,6 +594,7 @@ with tab_panel:
         df_mensual = df_hist.groupby("mes", as_index=False)["total"].sum().sort_values("mes")
         fig_mensual = px.bar(df_mensual, x="mes", y="total", labels={"mes": "Mes", "total": "Total facturado"})
         fig_mensual.update_traces(marker_color="#2F6FD6")
+        fig_mensual.update_xaxes(type="category")
         st.plotly_chart(estilizar_grafico(fig_mensual), use_container_width=True)
 
         col_a, col_b = st.columns(2)
@@ -647,14 +665,16 @@ with tab_nuevo:
         descripcion = st.text_input(
             "Descripción del concepto",
             value=servicio_sugerido["descripcion"] if servicio_sugerido else "",
+            max_chars=80,
         )
         col1, col2 = st.columns(2)
         with col1:
-            cantidad = st.number_input("Cantidad", min_value=1, value=1, step=1)
+            cantidad = st.number_input("Cantidad", min_value=1, max_value=50, value=1, step=1)
         with col2:
             precio_unitario = st.number_input(
                 "Precio unitario ($)",
                 min_value=0.0,
+                max_value=100000000.0,
                 value=float(servicio_sugerido["precio"]) if servicio_sugerido else 0.0,
                 step=100.0,
                 format="%.2f",
@@ -743,7 +763,7 @@ with tab_nuevo:
     with col1:
         descuento_pct = st.number_input("Descuento (%)", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
     with col2:
-        envio = st.number_input("Envío / Desplazamiento ($)", min_value=0.0, value=0.0, step=100.0)
+        envio = st.number_input("Envío / Desplazamiento ($)", min_value=0.0, max_value=100000000.0, value=0.0, step=100.0)
 
     st.subheader("Estado y Notas")
     estado = st.selectbox("Estado del presupuesto", ESTADOS, index=0)
@@ -1021,3 +1041,39 @@ with tab_historial:
                         )
                     if p.get("notas"):
                         st.caption(p["notas"])
+
+# ------------------------------------------------------------
+# TAB 4: PLAN PRO (mide interés, todavía no cobra)
+# ------------------------------------------------------------
+with tab_pro:
+    st.subheader("Plan Pro")
+    st.write(
+        "Hoy la app es gratis. Estamos evaluando un plan Pro y queremos saber si "
+        "te interesaría antes de armarlo. **Todavía no se cobra nada.**"
+    )
+
+    col_gratis, col_pro = st.columns(2)
+    with col_gratis:
+        with st.container(border=True):
+            st.markdown("**Gratis (hoy)**")
+            st.markdown(
+                "- Presupuestos en PDF\n"
+                "- Historial y panel de métricas\n"
+                "- Tu logo y tus datos\n"
+                "- Marca \"Hecho con Paperlit\" en el PDF"
+            )
+    with col_pro:
+        with st.container(border=True):
+            st.markdown("**Pro (en estudio)**")
+            st.markdown(
+                "- PDF sin la marca de Paperlit\n"
+                "- Presupuestos ilimitados\n"
+                "- Cuenta con contraseña y datos guardados\n"
+                "- Soporte por WhatsApp"
+            )
+
+    st.write("")
+    if URL_FORMULARIO_PRO:
+        st.link_button("Quiero probar el Plan Pro", URL_FORMULARIO_PRO, type="primary", use_container_width=True)
+    else:
+        st.caption("Pronto vas a poder anotarte acá.")
