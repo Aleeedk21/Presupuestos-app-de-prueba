@@ -457,6 +457,21 @@ st.markdown(
         background-color: var(--navy-light);
     }
 
+    /* Campos de texto, número, lista desplegable y fecha con borde visible */
+    div[data-baseweb="input"],
+    div[data-baseweb="textarea"],
+    div[data-baseweb="select"] > div {
+        border: 1.5px solid #5B82BE !important;
+        border-radius: 10px !important;
+        background-color: rgba(11, 37, 69, 0.55) !important;
+    }
+    div[data-baseweb="input"]:focus-within,
+    div[data-baseweb="textarea"]:focus-within,
+    div[data-baseweb="select"] > div:focus-within {
+        border-color: var(--accent-hover) !important;
+        box-shadow: 0 0 0 1px var(--accent-hover);
+    }
+
     .header-banner {
         background: linear-gradient(135deg, var(--navy-light), var(--accent));
         padding: 22px 16px;
