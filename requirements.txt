@@ -1,4 +1,4 @@
-streamlit
+streamlit>=1.35
 fpdf2
 pandas
 plotly
