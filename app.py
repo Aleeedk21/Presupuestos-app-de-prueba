@@ -1,5 +1,5 @@
 """
-Gestor de Presupuestos - Multi Rubro
+Gestor de Presupuestos - Multi Rubro (Presupify)
 --------------------------------------------------------------
 Pensada para cualquier oficio (aire acondicionado, electricidad,
 plomería, albañilería, pintura, gasista, etc.), no solo climatización.
@@ -14,33 +14,35 @@ Notas para quien esté aprendiendo Python con este código:
 - RUBROS es un diccionario que funciona como "tabla de configuración":
   en vez de escribir un if/elif gigante por cada rubro, buscamos sus
   datos con RUBROS[nombre_del_rubro]. Es un patrón muy común.
+- Los CONCEPTOS del presupuesto ya no son una tabla tipo Excel: cada uno
+  es una "tarjeta" con campos redondeados. Para que eso funcione, cada
+  concepto tiene un ID único (uid) y sus campos se guardan en
+  st.session_state con claves como "c_desc_<uid>" (descripción),
+  "c_cant_<uid>" (cantidad), "c_prec_<uid>" (precio) y "c_cat_<uid>"
+  (categoría). La lista st.session_state.conceptos guarda solo los uid,
+  en orden. Así, borrar un concepto del medio no mezcla los demás.
 - En la pestaña "Panel" usamos pandas para transformar la lista de
   presupuestos (que es una lista de diccionarios) en una tabla, y
-  poder agruparla y sumarla fácil con groupby(). Fijate que en la
-  pestaña "Nuevo Presupuesto" hacemos ese mismo tipo de resumen a
-  mano con un diccionario común (ver `resumen_por_categoria`) — es
-  la misma idea, pandas simplemente lo hace más cómodo cuando hay
-  muchos datos.
+  poder agruparla y sumarla fácil con groupby().
 - CALLBACKS (on_click / on_change): son funciones que Streamlit ejecuta
   ANTES de volver a correr el script, apenas el usuario toca un botón o
   cambia un campo. Son la forma correcta de modificar el valor de otros
-  campos (por ejemplo, rellenar la descripción al elegir un servicio).
-  Si intentás cambiar el valor de un campo después de que ya se dibujó
-  en pantalla, Streamlit da error.
+  campos. Si intentás cambiar el valor de un campo después de que ya se
+  dibujó en pantalla, Streamlit da error.
 """
 
-import http
-
-import streamlit as st
-import pandas as pd
-import plotly.express as px
+import base64
+import html
 import json
 import os
 import shutil
 import uuid
-import base64
 from datetime import date, datetime
 from urllib.parse import quote
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
 from fpdf import FPDF
 
 # ============================================================
@@ -152,10 +154,25 @@ ADICIONALES_RAPIDOS_GENERICOS = [
 
 # set_page_config tiene que ser el PRIMER comando de Streamlit del script.
 st.set_page_config(
-    page_title="Gestor de Presupuestos",
+    page_title="Presupify",
     layout="centered",
     initial_sidebar_state="collapsed",  # la barra lateral (código personal) queda como opción secundaria
 )
+
+# Etiquetas de los campos de cada concepto (ver notas al inicio del archivo)
+PREFIJOS_CONCEPTO = ("c_desc_", "c_cant_", "c_prec_", "c_cat_", "c_tot_")
+PREFIJOS_ADICIONAL = ("a_desc_", "a_prec_")
+
+# Categoría que existe en TODOS los rubros: se usa para conceptos nuevos en blanco.
+CATEGORIA_POR_DEFECTO = "Otro"
+
+# Clase CSS de la "píldora" de estado (historial)
+CLASE_ESTADO = {
+    "Pendiente": "estado-pendiente",
+    "Aprobado": "estado-aprobado",
+    "Rechazado": "estado-rechazado",
+    "Completado": "estado-completado",
+}
 
 
 # ============================================================
@@ -168,10 +185,28 @@ def safe_txt(s: str) -> str:
     return str(s).encode("latin-1", "replace").decode("latin-1")
 
 
+def esc(texto) -> str:
+    """Escapa un texto para insertarlo dentro de HTML (evita que un nombre con
+    símbolos como < o & rompa la página)."""
+    return html.escape(str(texto if texto is not None else ""))
+
+
+def moneda(valor, decimales=2) -> str:
+    """Formato argentino: $ 1.234,56 (punto para los miles, coma para los decimales)."""
+    try:
+        numero = float(valor or 0)
+    except (TypeError, ValueError):
+        numero = 0.0
+    texto = f"{abs(numero):,.{decimales}f}"
+    # Intercambia , y . pasando por un símbolo temporal para no pisarlos.
+    texto = texto.replace(",", "#").replace(".", ",").replace("#", ".")
+    return f"-$ {texto}" if numero < 0 else f"$ {texto}"
+
+
 def dinero(valor) -> str:
-    """Formatea un monto para mostrarlo en texto Markdown.
-    La barra invertida evita que Streamlit tome dos signos $ como una fórmula."""
-    return f"\\$ {valor:,.2f}"
+    """Igual que moneda(), pero para texto Markdown: la barra invertida evita
+    que Streamlit tome dos signos $ como una fórmula."""
+    return moneda(valor).replace("$", "\\$")
 
 
 def normalizar_codigo(texto) -> str:
@@ -202,7 +237,6 @@ def limpiar_notas(texto) -> str:
 def limpiar_telefono(texto) -> str:
     """Deja solo dígitos en un número de teléfono (remueve espacios, guiones, +)."""
     return "".join(c for c in str(texto or "") if c.isdigit())
-
 
 # ============================================================
 # PERSISTENCIA - ARCHIVOS POR CÓDIGO DE SESIÓN
@@ -241,7 +275,8 @@ def cargar_config():
     default = {
         "nombre": "Mi Negocio de Servicios",
         "rubro": "Aire Acondicionado",
-        "telefono": "",
+        "email": "",
+        "web": "",
         "zona": "",
         "whatsapp": "",
         "validez_dias": 7,
@@ -307,7 +342,6 @@ def migrar_datos(codigo_origen, codigo_destino, config_actual):
     with open(archivo_config(codigo_destino), "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
-
 # ============================================================
 # GENERACIÓN DE PDF
 # ============================================================
@@ -329,16 +363,18 @@ class PDFPresupuesto(FPDF):
 
         self.set_font("Helvetica", "B", 16)
         self.set_text_color(*NAVY_RGB)
-        self.cell(0, 10, safe_txt(self.empresa.get("nombre", "")), ln=True, align="C")
+        self.cell(0, 10, safe_txt(self.empresa.get("nombre", "")), new_x="LMARGIN", new_y="NEXT", align="C")
 
-        partes_info = [x for x in [
-            f"Tel: {self.empresa.get('telefono', '')}" if self.empresa.get("telefono") else "",
-            self.empresa.get("rubro", ""),
-            self.empresa.get("zona", ""),
-        ] if x]
+        # Dos renglones chicos: actividad y zona / email y página web (los vacíos no se muestran).
         self.set_font("Helvetica", "", 10)
         self.set_text_color(90, 90, 90)
-        self.cell(0, 6, safe_txt("   |   ".join(partes_info)), ln=True, align="C")
+        for partes in (
+            [self.empresa.get("rubro", ""), self.empresa.get("zona", "")],
+            [self.empresa.get("email", ""), self.empresa.get("web", "")],
+        ):
+            partes = [x for x in partes if x]
+            if partes:
+                self.cell(0, 6, safe_txt("   |   ".join(partes)), new_x="LMARGIN", new_y="NEXT", align="C")
 
         self.set_draw_color(*NAVY_RGB)
         self.set_line_width(0.6)
@@ -351,20 +387,100 @@ class PDFPresupuesto(FPDF):
         self.set_text_color(130, 130, 130)
         firma = self.empresa.get("firma_texto", "")
         if firma:
-            self.cell(0, 5, safe_txt(firma), ln=True, align="C")
+            self.cell(0, 5, safe_txt(firma), new_x="LMARGIN", new_y="NEXT", align="C")
         texto = f"Presupuesto generado el {datetime.now().strftime('%d/%m/%Y %H:%M')} - Página {self.page_no()}"
-        self.cell(0, 5, safe_txt(texto), ln=True, align="C")
+        self.cell(0, 5, safe_txt(texto), new_x="LMARGIN", new_y="NEXT", align="C")
         marca = "Hecho con Presupify" + (f" - {URL_APP}" if URL_APP else "")
         self.cell(0, 5, safe_txt(marca), align="C")
 
+# Anchos de las columnas de la tabla del PDF (suman 180 mm = ancho útil de la hoja)
+PDF_ANCHOS = [85, 15, 38, 42]
+PDF_ENCABEZADOS = ["Concepto", "Cant.", "P. Unit.", "Subtotal"]
+PDF_ALTO_LINEA = 5  # alto (mm) de cada renglón de texto dentro de una fila
 
-def ajustar_texto(pdf, texto, ancho):
+
+def partir_texto(pdf, texto, ancho):
+    """Divide un texto en renglones que entren en 'ancho' mm, cortando por palabras.
+    Así las descripciones largas se ven completas (en vez de cortarse con '...')."""
     texto = safe_txt(texto)
-    if pdf.get_string_width(texto) <= ancho - 2:
-        return texto
-    while texto and pdf.get_string_width(texto + "...") > ancho - 2:
-        texto = texto[:-1]
-    return texto + "..."
+    ancho_util = ancho - 3
+    renglones = []
+    actual = ""
+    for palabra in texto.split():
+        # Una palabra más larga que toda la celda se corta por letras.
+        while pdf.get_string_width(palabra) > ancho_util:
+            corte = len(palabra)
+            while corte > 1 and pdf.get_string_width(palabra[:corte]) > ancho_util:
+                corte -= 1
+            if actual:
+                renglones.append(actual)
+                actual = ""
+            renglones.append(palabra[:corte])
+            palabra = palabra[corte:]
+        prueba = f"{actual} {palabra}".strip()
+        if pdf.get_string_width(prueba) <= ancho_util:
+            actual = prueba
+        else:
+            renglones.append(actual)
+            actual = palabra
+    if actual:
+        renglones.append(actual)
+    return renglones or [""]
+
+
+def dibujar_encabezado_tabla(pdf):
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_fill_color(*NAVY_RGB)
+    pdf.set_draw_color(*NAVY_RGB)
+    pdf.set_line_width(0.2)
+    pdf.set_text_color(255, 255, 255)
+    for ancho, titulo in zip(PDF_ANCHOS, PDF_ENCABEZADOS):
+        pdf.cell(ancho, 8, titulo, border=1, align="C", fill=True)
+    pdf.ln()
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_draw_color(190, 198, 210)
+
+
+def dibujar_fila_tabla(pdf, item, con_fondo):
+    """Dibuja una fila de la tabla. Su alto depende de cuántos renglones
+    ocupa la descripción."""
+    renglones = partir_texto(pdf, item["descripcion"], PDF_ANCHOS[0])
+    alto_texto = PDF_ALTO_LINEA * len(renglones)
+    alto = max(7, alto_texto + 2)
+
+    # Si la fila no entra en lo que queda de la hoja, pasa a la página siguiente
+    # (repitiendo el encabezado de la tabla).
+    if pdf.get_y() + alto > pdf.page_break_trigger:
+        pdf.add_page()
+        dibujar_encabezado_tabla(pdf)
+
+    x0, y0 = pdf.l_margin, pdf.get_y()
+    if con_fondo:
+        pdf.set_fill_color(240, 243, 248)
+    estilo = "DF" if con_fondo else "D"
+    x = x0
+    for ancho in PDF_ANCHOS:
+        pdf.rect(x, y0, ancho, alto, style=estilo)
+        x += ancho
+
+    # Descripción (varios renglones, centrados verticalmente en la fila)
+    y_texto = y0 + (alto - alto_texto) / 2
+    for k, renglon in enumerate(renglones):
+        pdf.set_xy(x0 + 1, y_texto + k * PDF_ALTO_LINEA)
+        pdf.cell(PDF_ANCHOS[0] - 2, PDF_ALTO_LINEA, renglon)
+
+    # Cantidad, precio unitario y subtotal (centrados verticalmente)
+    x = x0 + PDF_ANCHOS[0]
+    for ancho, texto, alineado in (
+        (PDF_ANCHOS[1], f"{item['cantidad']:g}", "C"),
+        (PDF_ANCHOS[2], moneda(item["precio_unitario"]), "R"),
+        (PDF_ANCHOS[3], moneda(item["subtotal"]), "R"),
+    ):
+        pdf.set_xy(x + (0 if alineado == "C" else 1), y0)
+        pdf.cell(ancho - (0 if alineado == "C" else 2), alto, texto, align=alineado)
+        x += ancho
+    pdf.set_xy(x0, y0 + alto)
 
 
 def generar_pdf(presupuesto, empresa) -> bytes:
@@ -373,62 +489,46 @@ def generar_pdf(presupuesto, empresa) -> bytes:
 
     pdf.set_font("Helvetica", "B", 12)
     pdf.set_text_color(0, 0, 0)
-    pdf.cell(0, 8, safe_txt(f"Presupuesto N° {presupuesto['id']:04d}"), ln=True)
+    pdf.cell(0, 8, safe_txt(f"Presupuesto N° {presupuesto['id']:04d}"), new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 11)
-    pdf.cell(0, 6, safe_txt(f"Fecha: {presupuesto['fecha']}"), ln=True)
-    pdf.cell(0, 6, safe_txt(f"Estado: {presupuesto.get('estado', 'Pendiente')}"), ln=True)
+    pdf.cell(0, 6, safe_txt(f"Fecha: {presupuesto['fecha']}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, safe_txt(f"Estado: {presupuesto.get('estado', 'Pendiente')}"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(2)
 
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 7, "Datos del Cliente", ln=True)
+    pdf.cell(0, 7, "Datos del Cliente", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, safe_txt(f"Cliente: {presupuesto['cliente_nombre']}"), ln=True)
-    pdf.cell(0, 6, safe_txt(f"Dirección: {presupuesto['cliente_direccion']}"), ln=True)
-    pdf.cell(0, 6, safe_txt(f"Teléfono: {presupuesto['cliente_telefono']}"), ln=True)
+    pdf.cell(0, 6, safe_txt(f"Cliente: {presupuesto['cliente_nombre']}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, safe_txt(f"Dirección: {presupuesto['cliente_direccion']}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, safe_txt(f"Teléfono: {presupuesto['cliente_telefono']}"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
-    col_widths = [85, 15, 38, 42]
-    headers = ["Concepto", "Cant.", "P. Unit.", "Subtotal"]
+    dibujar_encabezado_tabla(pdf)
+    for indice, item in enumerate(presupuesto["items"]):
+        dibujar_fila_tabla(pdf, item, con_fondo=(indice % 2 == 1))
 
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.set_fill_color(*NAVY_RGB)
-    pdf.set_text_color(255, 255, 255)
-    for w, h in zip(col_widths, headers):
-        pdf.cell(w, 8, h, border=1, align="C", fill=True)
-    pdf.ln()
+    pdf.ln(3)
 
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(0, 0, 0)
-    fill = False
-    for item in presupuesto["items"]:
-        pdf.set_fill_color(240, 240, 240)
-        pdf.cell(col_widths[0], 7, ajustar_texto(pdf, item["descripcion"], col_widths[0]), border=1, fill=fill)
-        pdf.cell(col_widths[1], 7, f"{item['cantidad']:g}", border=1, align="C", fill=fill)
-        pdf.cell(col_widths[2], 7, f"${item['precio_unitario']:,.2f}", border=1, align="R", fill=fill)
-        pdf.cell(col_widths[3], 7, f"${item['subtotal']:,.2f}", border=1, align="R", fill=fill)
-        pdf.ln()
-        fill = not fill
-
-    pdf.ln(2)
-
-    x_label = sum(col_widths[:3])
+    x_label = sum(PDF_ANCHOS[:3])
+    ancho_monto = PDF_ANCHOS[3]
     pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(0, 0, 0)
     pdf.cell(x_label, 7, "Subtotal", align="R")
-    pdf.cell(col_widths[3], 7, f"${presupuesto['subtotal']:,.2f}", align="R", ln=True)
+    pdf.cell(ancho_monto, 7, moneda(presupuesto["subtotal"]), align="R", new_x="LMARGIN", new_y="NEXT")
 
     if presupuesto.get("descuento_pct", 0) > 0:
         pdf.cell(x_label, 7, safe_txt(f"Descuento ({presupuesto['descuento_pct']:g}%)"), align="R")
-        pdf.cell(col_widths[3], 7, f"-${presupuesto['descuento_monto']:,.2f}", align="R", ln=True)
+        pdf.cell(ancho_monto, 7, "-" + moneda(presupuesto["descuento_monto"]), align="R", new_x="LMARGIN", new_y="NEXT")
 
     if presupuesto.get("envio", 0) > 0:
         pdf.cell(x_label, 7, safe_txt("Envío / Desplazamiento"), align="R")
-        pdf.cell(col_widths[3], 7, f"${presupuesto['envio']:,.2f}", align="R", ln=True)
+        pdf.cell(ancho_monto, 7, moneda(presupuesto["envio"]), align="R", new_x="LMARGIN", new_y="NEXT")
 
     pdf.set_font("Helvetica", "B", 12)
     pdf.set_fill_color(*NAVY_RGB)
     pdf.set_text_color(255, 255, 255)
     pdf.cell(x_label, 9, "TOTAL", align="R", fill=True)
-    pdf.cell(col_widths[3], 9, f"${presupuesto['total']:,.2f}", align="R", fill=True, ln=True)
+    pdf.cell(ancho_monto, 9, moneda(presupuesto["total"]), align="R", fill=True, new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(0, 0, 0)
     pdf.ln(6)
 
@@ -447,12 +547,29 @@ def generar_pdf(presupuesto, empresa) -> bytes:
             pdf.add_page()
 
         pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(0, 7, safe_txt("Notas / Condiciones"), ln=True)
+        pdf.cell(0, 7, safe_txt("Notas / Condiciones"), new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", "", 9)
         pdf.multi_cell(0, 5, safe_txt(notas))
 
     return bytes(pdf.output())
 
+
+@st.cache_data(show_spinner=False, max_entries=100)
+def pdf_en_cache(presupuesto_json: str, empresa_json: str, logo_mtime: float) -> bytes:
+    """Versión con caché de generar_pdf(), para el Historial: evita rearmar
+    todos los PDF viejos cada vez que se toca cualquier botón de la app.
+    (logo_mtime cambia si se sube un logo nuevo, así el caché se renueva.)"""
+    return generar_pdf(json.loads(presupuesto_json), json.loads(empresa_json))
+
+
+def pdf_del_historial(presupuesto, empresa) -> bytes:
+    logo = empresa.get("logo_path", "")
+    logo_mtime = os.path.getmtime(logo) if logo and os.path.exists(logo) else 0.0
+    return pdf_en_cache(
+        json.dumps(presupuesto, sort_keys=True),
+        json.dumps(empresa, sort_keys=True),
+        logo_mtime,
+    )
 
 # ============================================================
 # DATOS PARA EL PANEL (pandas)
@@ -483,19 +600,26 @@ def construir_dataframe_items(historial):
             filas.append({"categoria": item["categoria"], "subtotal": item["subtotal"]})
     return pd.DataFrame(filas)
 
-
-def estilizar_grafico(fig):
+def estilizar_grafico(fig, prefijo_eje=None):
+    """Aplica los colores del tema activo a un gráfico de Plotly.
+    prefijo_eje: "x" o "y" si ese eje muestra dinero (agrega el signo $)."""
+    p = PALETAS[st.session_state.tema_actual]
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font_color="#EAF1FB",
+        font_color=p["text"],
         margin=dict(l=10, r=10, t=30, b=10),
         legend=dict(bgcolor="rgba(0,0,0,0)"),
         dragmode=False,  # sin arrastre: en el celular no interfiere con el scroll
+        separators=",.",  # formato argentino: coma decimal, punto de miles
     )
     # fixedrange=True desactiva el zoom y el desplazamiento de los ejes.
-    fig.update_xaxes(gridcolor="#26456F", fixedrange=True)
-    fig.update_yaxes(gridcolor="#26456F", fixedrange=True)
+    fig.update_xaxes(gridcolor=p["border"], fixedrange=True)
+    fig.update_yaxes(gridcolor=p["border"], fixedrange=True)
+    if prefijo_eje == "x":
+        fig.update_xaxes(tickprefix="$ ")
+    elif prefijo_eje == "y":
+        fig.update_yaxes(tickprefix="$ ")
     return fig
 
 
@@ -503,87 +627,77 @@ def kpi_card(label, value, color_class):
     # Todo en una sola línea: si el HTML queda indentado dentro de un
     # string multilínea, Streamlit lo puede interpretar como bloque de
     # código en vez de HTML real.
-    return f'<div class="kpi-card {color_class}"><div class="kpi-label">{label}</div><div class="kpi-value">{value}</div></div>'
+    return f'<div class="kpi-card {color_class}"><div class="kpi-label">{esc(label)}</div><div class="kpi-value">{esc(value)}</div></div>'
+
+
+def estado_pill(estado):
+    """HTML de la píldora de color con el estado de un presupuesto."""
+    clase = CLASE_ESTADO.get(estado, "estado-pendiente")
+    return f'<span class="estado-pill {clase}">{esc(estado)}</span>'
 
 
 # ============================================================
 # CALLBACKS (se ejecutan ANTES de redibujar la pantalla)
 # ============================================================
-def reiniciar_campos_item():
-    """Deja el formulario de ítem en blanco, con la primera categoría del rubro."""
-    categorias = config_del_rubro(st.session_state.empresa.get("rubro"))["categorias"]
-    st.session_state.servicio_sel = OPCION_PERSONALIZADO
-    st.session_state.item_categoria = categorias[0]
-    st.session_state.item_descripcion = ""
-    st.session_state.item_cantidad = 1
-    st.session_state.item_precio = 0.0
+def nuevo_concepto(categoria=CATEGORIA_POR_DEFECTO, descripcion="", cantidad=1.0, precio=0.0):
+    """Crea un concepto nuevo: genera su uid y deja cargados sus campos en
+    session_state. Devuelve el uid (el llamador lo agrega a la lista)."""
+    uid = uuid.uuid4().hex[:8]
+    st.session_state[f"c_desc_{uid}"] = str(descripcion)
+    st.session_state[f"c_cant_{uid}"] = max(0.01, float(cantidad or 1))
+    st.session_state[f"c_prec_{uid}"] = max(0.0, float(precio or 0))
+    st.session_state[f"c_cat_{uid}"] = categoria
+    return uid
+
+
+def agregar_concepto_vacio():
+    st.session_state.conceptos.append(nuevo_concepto())
+
+
+def quitar_concepto(uid):
+    if uid in st.session_state.conceptos:
+        st.session_state.conceptos.remove(uid)
+    for prefijo in PREFIJOS_CONCEPTO:
+        st.session_state.pop(prefijo + uid, None)
+
+
+def vaciar_conceptos():
+    for uid in list(st.session_state.conceptos):
+        quitar_concepto(uid)
 
 
 def al_cambiar_rubro():
-    """Guarda el rubro elegido arriba de todo y limpia el formulario de ítem
-    (las categorías y servicios cambian con el rubro)."""
+    """Guarda el rubro elegido arriba de todo. Los conceptos cuya categoría no
+    existe en el rubro nuevo pasan a 'Otro' (que existe en todos los rubros)."""
     st.session_state.empresa["rubro"] = st.session_state.rubro_selector
     guardar_config(st.session_state.empresa)
-    reiniciar_campos_item()
+    st.session_state.servicio_sel = None
+    categorias = config_del_rubro(st.session_state.empresa["rubro"])["categorias"]
+    for uid in st.session_state.conceptos:
+        if st.session_state.get(f"c_cat_{uid}") not in categorias:
+            st.session_state[f"c_cat_{uid}"] = CATEGORIA_POR_DEFECTO
 
 
-def al_elegir_servicio():
-    """Al elegir un servicio predefinido, rellena categoría, descripción y
-    precio. Con 'Personalizado...' deja descripción y precio en blanco."""
-    seleccion = st.session_state.servicio_sel
+def agregar_servicio_predefinido():
+    """Al elegir un servicio del desplegable, se suma como concepto nuevo
+    (con su categoría y precio) y el desplegable vuelve a quedar vacío."""
+    nombre = st.session_state.servicio_sel
+    st.session_state.servicio_sel = None
+    if not nombre:
+        return
     servicios = config_del_rubro(st.session_state.empresa.get("rubro"))["servicios"]
-    servicio = next((s for s in servicios if s["descripcion"] == seleccion), None)
-
-    if servicio is None:
-        st.session_state.item_descripcion = ""
-        st.session_state.item_precio = 0.0
-        return
-
-    st.session_state.item_categoria = servicio["categoria"]
-    st.session_state.item_descripcion = servicio["descripcion"]
-    st.session_state.item_precio = float(servicio["precio"])
-
-
-def agregar_item():
-    """Valida el formulario y agrega el ítem a la lista. Los avisos se
-    guardan en session_state y se muestran debajo del botón."""
-    descripcion = st.session_state.item_descripcion.strip()
-    cantidad = st.session_state.item_cantidad
-    precio = st.session_state.item_precio
-
-    if not descripcion:
-        st.session_state.aviso_item = ("error", "La descripción no puede estar vacía.")
-        return
-    if precio <= 0:
-        st.session_state.aviso_item = ("error", "El precio unitario debe ser mayor a 0.")
-        return
-
-    st.session_state.lista_items.append(
-        {
-            "categoria": st.session_state.item_categoria,
-            "descripcion": descripcion,
-            "cantidad": cantidad,
-            "precio_unitario": precio,
-            "subtotal": cantidad * precio,
-        }
-    )
-    st.session_state.reset_counter += 1  # refresca la tabla editable
-    reiniciar_campos_item()
-    st.session_state.aviso_item = ("ok", "Ítem agregado.")
+    servicio = next((s for s in servicios if s["descripcion"] == nombre), None)
+    if servicio:
+        st.session_state.conceptos.append(
+            nuevo_concepto(servicio["categoria"], servicio["descripcion"], 1, servicio["precio"])
+        )
 
 
 def agregar_adicional(adicional):
     """Agrega con un clic uno de los adicionales rápidos."""
-    st.session_state.lista_items.append(
-        {
-            "categoria": adicional.get("categoria", "Otro"),
-            "descripcion": adicional["descripcion"],
-            "cantidad": 1,
-            "precio_unitario": float(adicional["precio"]),
-            "subtotal": float(adicional["precio"]),
-        }
+    st.session_state.conceptos.append(
+        nuevo_concepto(adicional.get("categoria", CATEGORIA_POR_DEFECTO), adicional["descripcion"], 1, adicional["precio"])
     )
-    st.session_state.reset_counter += 1
 
 
 def duplicar_presupuesto(presupuesto):
@@ -591,33 +705,45 @@ def duplicar_presupuesto(presupuesto):
     st.session_state.cliente_nombre_input = presupuesto["cliente_nombre"]
     st.session_state.cliente_direccion_input = presupuesto.get("cliente_direccion", "")
     st.session_state.cliente_telefono_input = presupuesto.get("cliente_telefono", "")
-    st.session_state.lista_items = [dict(item) for item in presupuesto["items"]]
-    st.session_state.reset_counter += 1
+    vaciar_conceptos()
+    for item in presupuesto["items"]:
+        st.session_state.conceptos.append(
+            nuevo_concepto(
+                item.get("categoria", CATEGORIA_POR_DEFECTO),
+                item["descripcion"],
+                item.get("cantidad", 1),
+                item.get("precio_unitario", 0),
+            )
+        )
     st.toast('Datos copiados. Andá a la pestaña "Nuevo Presupuesto".')
 
 
-def limpiar_items():
-    """Borra todos los ítems cargados (por si se cargaron de más)."""
-    st.session_state.lista_items = []
-    st.session_state.reset_counter += 1
-    st.session_state.aviso_item = ("info", "Lista de ítems vaciada.")
+# --- Adicionales rápidos (pestaña Configuración): mismas tarjetas, sin tabla ---
+def nueva_fila_adicional(descripcion="", precio=0.0):
+    uid = uuid.uuid4().hex[:8]
+    st.session_state[f"a_desc_{uid}"] = str(descripcion)
+    st.session_state[f"a_prec_{uid}"] = max(0.0, float(precio or 0))
+    return uid
 
 
-def eliminar_filas_vacias():
-    """Elimina las filas sin descripción (o sin precio/cantidad útiles) para
-    limpiar las casillas que el usuario agregó sin querer."""
-    antes = len(st.session_state.lista_items)
-    st.session_state.lista_items = [
-        it for it in st.session_state.lista_items
-        if str(it.get("descripcion", "")).strip()
-        and float(it.get("precio_unitario", 0) or 0) > 0
+def agregar_fila_adicional():
+    st.session_state.adicionales_ids.append(nueva_fila_adicional())
+
+
+def quitar_fila_adicional(uid):
+    if uid in st.session_state.adicionales_ids:
+        st.session_state.adicionales_ids.remove(uid)
+    for prefijo in PREFIJOS_ADICIONAL:
+        st.session_state.pop(prefijo + uid, None)
+
+
+def cargar_filas_adicionales(adicionales):
+    """Descarta las filas actuales y arma una fila por cada adicional guardado."""
+    for uid in list(st.session_state.get("adicionales_ids", [])):
+        quitar_fila_adicional(uid)
+    st.session_state.adicionales_ids = [
+        nueva_fila_adicional(a["descripcion"], a["precio"]) for a in adicionales
     ]
-    st.session_state.reset_counter += 1
-    eliminadas = antes - len(st.session_state.lista_items)
-    if eliminadas > 0:
-        st.session_state.aviso_item = ("ok", f"Se eliminaron {eliminadas} fila(s) vacía(s).")
-    else:
-        st.session_state.aviso_item = ("info", "No había filas vacías para borrar.")
 
 
 def aplicar_codigo():
@@ -644,13 +770,13 @@ def aplicar_codigo():
     st.query_params["codigo"] = nuevo
 
     # Se descarta todo lo que pertenecía a la sesión anterior.
-    for clave in ("empresa", "pdf_actual", "pdf_actual_info", "pdf_actual_nombre", "rubro_selector"):
+    vaciar_conceptos()
+    for uid in list(st.session_state.get("adicionales_ids", [])):
+        quitar_fila_adicional(uid)
+    for clave in ("empresa", "pdf_actual", "pdf_actual_info", "pdf_actual_nombre", "rubro_selector", "adicionales_ids"):
         st.session_state.pop(clave, None)
-    st.session_state.lista_items = []
-    st.session_state.reset_counter += 1
     st.session_state.codigo_input = ""
     st.session_state.aviso_codigo = ("ok", mensaje)
-
 
 # ============================================================
 # SESIÓN: SE USA DE INMEDIATO, SIN PEDIR CÓDIGO
@@ -669,81 +795,220 @@ st.query_params["codigo"] = st.session_state.codigo
 # ============================================================
 # ESTADO INICIAL DE LA SESIÓN
 # ============================================================
-if "lista_items" not in st.session_state:
-    st.session_state.lista_items = []
+if "conceptos" not in st.session_state:
+    st.session_state.conceptos = []  # lista de uid, en orden (ver notas al inicio del archivo)
 
 if "empresa" not in st.session_state:
     st.session_state.empresa = cargar_config()
 
+if "adicionales_ids" not in st.session_state:
+    cargar_filas_adicionales(st.session_state.empresa.get("adicionales", []))
+
 if "pdf_actual" not in st.session_state:
     st.session_state.pdf_actual = None
 
-if "reset_counter" not in st.session_state:
-    st.session_state.reset_counter = 0
+# ======== TEMAS: Azul Marino (por defecto) y Oscuro ========
+# El modo claro se quitó. Si más adelante hace falta, se agrega una paleta
+# "light" nueva en PALETAS y una entrada en TEMAS_DISPONIBLES.
+TEMAS_DISPONIBLES = {
+    "navy": {"label": "Azul Marino"},
+    "dark": {"label": "Oscuro"},
+}
+# Cada paleta define directamente los colores que se inyectan como CSS variables en :root
+# (no usamos data-tema ni JS observers: es 100% CSS plano — más robusto, no hay FOUC)
+PALETAS = {
+    "navy": {
+        "bg_page":    "#0B2545",
+        "bg_surface": "#163A6B",
+        "bg_soft":    "#1B4379",
+        "bg_card":    "#14325E",
+        "border":     "#26456F",
+        "accent":     "#2F6FD6",
+        "accent_hover": "#4C8CF0",
+        "accent_bg":  "rgba(47,111,214,0.18)",
+        "text":       "#EAF1FB",
+        "text_soft":  "#A7C2E6",
+        "text_muted": "#89A7CC",
+        "input_bg":   "rgba(11, 37, 69, 0.60)",
+        "green":      "#1FA97A",
+        "orange":     "#E0972B",
+        "red":        "#D1445C",
+        "shadow_lg":  "0 10px 30px rgba(0,0,0,0.32)",
+        "shadow_sm":  "0 4px 12px rgba(0,0,0,0.22)",
+    },
+    "dark": {
+        "bg_page":    "#14141B",
+        "bg_surface": "#1C1C26",
+        "bg_soft":    "#22222F",
+        "bg_card":    "#1A1A23",
+        "border":     "#2E2E3C",
+        "accent":     "#6E7CF7",
+        "accent_hover": "#8E9AFF",
+        "accent_bg":  "rgba(110,124,247,0.22)",
+        "text":       "#F2F2F7",
+        "text_soft":  "#B8B8CC",
+        "text_muted": "#88889C",
+        "input_bg":   "#101017",
+        "green":      "#2BBF8B",
+        "orange":     "#EBA945",
+        "red":        "#DC5A70",
+        "shadow_lg":  "0 10px 30px rgba(0,0,0,0.55)",
+        "shadow_sm":  "0 4px 12px rgba(0,0,0,0.40)",
+    },
+}
+# Si la sesión traía un tema que ya no existe (ej: "light"), vuelve al azul marino.
+if st.session_state.get("tema_actual") not in PALETAS:
+    st.session_state.tema_actual = "navy"
 
-# Valores iniciales de los campos del formulario de ítem
-st.session_state.setdefault("servicio_sel", OPCION_PERSONALIZADO)
-st.session_state.setdefault("item_descripcion", "")
-st.session_state.setdefault("item_cantidad", 1)
-st.session_state.setdefault("item_precio", 0.0)
+# Desplegable de servicios predefinidos (arranca sin selección)
+st.session_state.setdefault("servicio_sel", None)
 
 
 # ============================================================
-# ESTILOS (paleta azul marino / blanco, sin emojis, más profundidad)
+# ESTILOS — 2 TEMAS (inyectados por f-string, SIN data-tema ni JS)
 # ============================================================
+_TEMA_ACTUAL = st.session_state.tema_actual
+_P = PALETAS[_TEMA_ACTUAL]  # paleta activa
+
 st.markdown(
-    """
+    f"""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
 
-    :root {
-        --navy: #0B2545;
-        --navy-light: #163A6B;
-        --accent: #2F6FD6;
-        --accent-hover: #4C8CF0;
-        --text-light: #EAF1FB;
-        --border: #26456F;
-        --green: #1FA97A;
-        --orange: #E0972B;
-        --red: #D1445C;
-    }
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-    h1, h2, h3, h4 { color: var(--text-light) !important; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-    div.stButton > button, div.stDownloadButton > button, div[data-testid="stFormSubmitButton"] > button {
-        background-color: var(--accent);
+    /* ===== Base común ===== */
+    html, body, [class*="css"] {{
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+    }}
+    h1, h2, h3, h4, h5, h6 {{ font-family: 'Inter', sans-serif; letter-spacing: -0.01em; }}
+
+    /* VARIABLES DEL TEMA ACTIVO (inyectadas al arrancar, siempre ganan) */
+    :root {{
+        --bg-page:        {_P['bg_page']};
+        --bg-surface:     {_P['bg_surface']};
+        --bg-soft:        {_P['bg_soft']};
+        --bg-card:        {_P['bg_card']};
+        --border:         {_P['border']};
+        --accent:         {_P['accent']};
+        --accent-hover:   {_P['accent_hover']};
+        --accent-bg:      {_P['accent_bg']};
+        --text:           {_P['text']};
+        --text-soft:      {_P['text_soft']};
+        --text-muted:     {_P['text_muted']};
+        --input-bg:       {_P['input_bg']};
+        --green:          {_P['green']};
+        --orange:         {_P['orange']};
+        --red:            {_P['red']};
+        --shadow-lg:      {_P['shadow_lg']};
+        --shadow-sm:      {_P['shadow_sm']};
+    }}
+
+    /* Fondo de página + container principal (más ancho) */
+    .stApp,
+    section.main,
+    .block-container,
+    [data-testid="stAppViewContainer"],
+    [data-testid="stApp"] {{
+        background: var(--bg-page) !important;
+        color: var(--text) !important;
+    }}
+    .block-container {{
+        max-width: 880px !important;
+        padding-top: 1.2rem !important;
+        padding-bottom: 3rem !important;
+    }}
+    [data-testid="stHeader"] {{ background: transparent !important; }}
+    [data-testid="stToolbar"] {{ color: var(--text-soft) !important; }}
+    p, span, label, li, div {{ color: var(--text) !important; }}
+    small {{ color: var(--text-muted) !important; }}
+    h1, h2, h3, h4, h5, h6 {{ color: var(--text) !important; }}
+
+    /* ==================== BOTONES ==================== */
+    div.stButton > button,
+    div.stDownloadButton > button,
+    div[data-testid="stFormSubmitButton"] > button,
+    div.stLinkButton > a {{
+        background-color: var(--accent) !important;
         color: #FFFFFF !important;
-        border-radius: 10px;
-        border: none;
-        padding: 0.55em 1.2em;
+        border-radius: 999px;
+        border: none !important;
+        padding: 0.65em 1.3em;
         font-weight: 600;
-        transition: transform 0.05s ease-in;
-    }
-    div.stButton > button:hover, div.stDownloadButton > button:hover,
-    div[data-testid="stFormSubmitButton"] > button:hover {
-        background-color: var(--accent-hover);
+        font-family: 'Inter', sans-serif;
+        letter-spacing: 0.005em;
+        transition: all 0.15s ease;
+        box-shadow: 0 3px 8px var(--accent-bg);
+    }}
+    div.stButton > button:hover,
+    div.stDownloadButton > button:hover,
+    div.stLinkButton > a:hover,
+    div[data-testid="stFormSubmitButton"] > button:hover {{
+        background-color: var(--accent-hover) !important;
+        transform: translateY(-1px);
+        box-shadow: 0 6px 14px var(--accent-bg);
         color: #FFFFFF !important;
-    }
-    div.stButton > button:active { transform: scale(0.98); }
+    }}
+    div.stButton > button:active,
+    div.stDownloadButton > button:active {{ transform: scale(0.98); }}
 
-    [data-testid="stMetric"] {
-        background-color: var(--navy-light);
+    /* Botones SECONDARY (botones de tema no-activo, etc.) */
+    div.stButton > button[kind="secondary"],
+    div.stDownloadButton > button[kind="secondary"],
+    div[data-testid="stBaseButton-secondary"] {{
+        background-color: var(--bg-soft) !important;
+        color: var(--text) !important;
+        border: 1.5px solid var(--border) !important;
+        border-radius: 999px !important;
+        box-shadow: none !important;
+    }}
+    div.stButton > button[kind="secondary"]:hover,
+    div[data-testid="stBaseButton-secondary"]:hover {{
+        background-color: var(--accent-bg) !important;
+        color: var(--text) !important;
+        border-color: var(--accent) !important;
+        transform: translateY(-1px);
+    }}
+
+    /* ==================== TÍTULOS / SUBTÍTULOS (estilo PÍLDORA minimalista) ==================== */
+    h2, h3 {{
+        display: inline-block !important;
+        background: transparent !important;
+        padding: 0.15em 0.15em 0.35em 0.15em !important;
+        margin-top: 0.4em !important;
+        margin-bottom: 0.8em !important;
+        border: none !important;
+        border-radius: 14px !important;
+        border-bottom: 3px solid var(--accent) !important;
+        letter-spacing: -0.01em;
+    }}
+    h2 {{ border-bottom-width: 3.5px !important; }}
+    h3 {{ border-bottom-width: 2.5px !important; }}
+
+    /* ==================== MÉTRICAS (st.metric) ==================== */
+    [data-testid="stMetric"] {{
+        background-color: var(--bg-card);
         border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 10px 16px;
-        box-shadow: 0 4px 10px rgba(0,0,0,0.25);
-    }
-    [data-testid="stMetricValue"] { color: var(--text-light) !important; }
-    [data-testid="stMetricLabel"] { color: var(--text-light) !important; }
+        border-radius: 14px;
+        padding: 12px 18px;
+        box-shadow: var(--shadow-sm);
+    }}
+    [data-testid="stMetricValue"] {{ color: var(--text) !important; font-weight: 700; }}
+    [data-testid="stMetricLabel"] {{ color: var(--text-soft) !important; font-weight: 500; }}
 
-    div[data-testid="stExpander"], div[data-testid="stForm"] {
-        border-radius: 12px;
-        border: 1px solid var(--border);
-        background-color: var(--navy-light);
-    }
+    /* ==================== EXPANDERS / FORMS ==================== */
+    div[data-testid="stExpander"],
+    div[data-testid="stForm"] {{
+        border-radius: 14px;
+        border: 1px solid var(--border) !important;
+        background-color: var(--bg-card);
+        box-shadow: var(--shadow-sm);
+    }}
+    details > summary {{ color: var(--text) !important; font-weight: 600; }}
+    div[data-testid="stExpander"]:hover {{ border-color: var(--accent) !important; }}
 
-    /* Campos de texto, número, lista desplegable y fecha con borde visible
-       (incluye selectores para versiones nuevas y viejas de Streamlit) */
+    /* Inputs / selectores con borde visible */
     div[data-baseweb="input"],
     div[data-baseweb="textarea"],
     div[data-baseweb="select"] > div,
@@ -751,33 +1016,35 @@ st.markdown(
     [data-testid="stNumberInputContainer"],
     [data-testid="stTextAreaRootElement"],
     [data-testid="stDateInputField"],
-    [data-testid="stSelectbox"] div[role="group"] {
-        border: 1.5px solid #5B82BE !important;
-        border-radius: 10px !important;
-        background-color: rgba(11, 37, 69, 0.6) !important;
-        box-shadow: inset 0 1px 2px rgba(0,0,0,0.18);
-        min-height: 44px;
-    }
-    /* Texto dentro de los inputs: padding y color legible */
+    [data-testid="stSelectbox"] div[role="group"] {{
+        border: 1.5px solid var(--border) !important;
+        border-radius: 12px !important;
+        background-color: var(--input-bg) !important;
+        box-shadow: inset 0 1px 2px rgba(0,0,0,0.08);
+        min-height: 46px;
+        transition: border-color .15s ease, box-shadow .15s ease;
+    }}
+    /* Texto dentro de inputs */
     div[data-baseweb="input"] input,
     div[data-baseweb="textarea"] textarea,
     [data-testid="stTextInputRootElement"] input,
     [data-testid="stNumberInputContainer"] input,
     [data-testid="stTextAreaRootElement"] textarea,
-    [data-testid="stDateInputField"] input {
-        color: var(--text-light) !important;
-        padding: 8px 12px !important;
+    [data-testid="stDateInputField"] input {{
+        color: var(--text) !important;
+        padding: 10px 14px !important;
         font-size: 0.95rem !important;
         font-family: 'Inter', sans-serif !important;
-    }
-    /* Placeholder más suave */
+    }}
+    /* Placeholder adaptado */
     div[data-baseweb="input"] input::placeholder,
     div[data-baseweb="textarea"] textarea::placeholder,
     [data-testid="stTextInputRootElement"] input::placeholder,
-    [data-testid="stTextAreaRootElement"] textarea::placeholder {
-        color: #89A7CC !important;
-        opacity: 0.85;
-    }
+    [data-testid="stTextAreaRootElement"] textarea::placeholder {{
+        color: var(--text-muted) !important;
+        opacity: 0.9;
+    }}
+    /* Foco con glow del accent */
     div[data-baseweb="input"]:focus-within,
     div[data-baseweb="textarea"]:focus-within,
     div[data-baseweb="select"] > div:focus-within,
@@ -785,205 +1052,450 @@ st.markdown(
     [data-testid="stNumberInputContainer"]:focus-within,
     [data-testid="stTextAreaRootElement"]:focus-within,
     [data-testid="stDateInputField"]:focus-within,
-    [data-testid="stSelectbox"] div[role="group"]:focus-within {
+    [data-testid="stSelectbox"] div[role="group"]:focus-within {{
         border-color: var(--accent-hover) !important;
-        box-shadow: 0 0 0 2px rgba(76, 140, 240, 0.22), inset 0 1px 2px rgba(0,0,0,0.18) !important;
-    }
+        box-shadow: 0 0 0 2px var(--accent-bg), inset 0 1px 2px rgba(0,0,0,0.10) !important;
+    }}
 
-    /* Pestañas (tabs): estilo más limpio, tipo tarjeta */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 6px;
-        background-color: rgba(11, 37, 69, 0.5);
-        padding: 6px;
-        border-radius: 14px;
-        border: 1px solid var(--border);
-    }
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 10px;
-        padding: 10px 16px !important;
-        color: #A7C2E6 !important;
-        font-weight: 500;
+    /* Pestañas (tabs): estilo PÍLDORA minimalista 100% adaptable al tema */
+    /* Contenedor exterior (la "barra" de las tabs) */
+    .stTabs [role="tablist"],
+    [data-testid="stTabs"] [role="tablist"],
+    .stTabs [data-baseweb="tab-list"],
+    [data-testid="stTabs"] [data-baseweb="tab-list"] {{
+        gap: 8px !important;
+        background-color: var(--bg-soft) !important;
+        padding: 8px !important;
+        border-radius: 999px !important;
+        border: 1px solid var(--border) !important;
+        box-shadow: var(--shadow-sm) !important;
+        display: flex;
+        overflow: hidden;
+    }}
+    /* Cada pestaña individual (no seleccionada) */
+    .stTabs [role="tab"],
+    [data-testid="stTabs"] [role="tab"],
+    [data-testid="stTab"],
+    .stTabs [data-baseweb="tab"] {{
+        border-radius: 999px !important;
+        padding: 12px 22px !important;
+        color: var(--text-soft) !important;
+        font-weight: 500 !important;
         font-family: 'Inter', sans-serif !important;
-    }
-    .stTabs [data-baseweb="tab"]:hover {
-        background-color: rgba(47, 111, 214, 0.18) !important;
-        color: #FFFFFF !important;
-    }
-    .stTabs [aria-selected="true"] {
+        border: none !important;
+        border-bottom: none !important;
+        background: transparent !important;
+        background-image: none !important;
+        box-shadow: none !important;
+        transition: all .18s ease !important;
+        white-space: nowrap;
+    }}
+    /* Hover en pestaña no-activa */
+    .stTabs [role="tab"]:hover,
+    [data-testid="stTabs"] [role="tab"]:hover,
+    [data-testid="stTab"]:hover,
+    .stTabs [data-baseweb="tab"]:hover {{
+        background-color: var(--accent-bg) !important;
+        color: var(--text) !important;
+        border: none !important;
+        border-bottom: none !important;
+        background-image: none !important;
+    }}
+    /* Pestaña ACTIVA (color del tema) */
+    .stTabs [role="tab"][aria-selected="true"],
+    [data-testid="stTabs"] [role="tab"][aria-selected="true"],
+    [data-testid="stTab"][aria-selected="true"],
+    .stTabs [data-baseweb="tab"][aria-selected="true"] {{
         background-color: var(--accent) !important;
         color: #FFFFFF !important;
-        font-weight: 600;
-        box-shadow: 0 3px 8px rgba(47, 111, 214, 0.4);
-    }
+        font-weight: 600 !important;
+        border: none !important;
+        border-bottom: none !important;
+        background-image: none !important;
+        box-shadow: 0 4px 12px var(--accent-bg) !important;
+        border-radius: 999px !important;
+    }}
+    /* Quitar la barrita inferior azul dura que Streamlit agrega por defecto */
+    .stTabs [role="tab"]::after,
+    .stTabs [data-baseweb="tab"]::after,
+    [data-testid="stTab"]::after,
+    [role="tablist"] > *::after {{
+        display: none !important;
+        content: none !important;
+        background: transparent !important;
+        border: none !important;
+    }}
 
-    /* Containers con borde: suaves y con sombra */
+    /* Containers con borde */
     div[data-testid="stVerticalBlockBorderWrapper"] > div,
-    div[data-testid="stContainer"] [data-testid="stVerticalBlockBorderWrapper"] {
-        border-radius: 14px !important;
+    div[data-testid="stContainer"] [data-testid="stVerticalBlockBorderWrapper"] {{
+        border-radius: 16px !important;
         border: 1px solid var(--border) !important;
-        background-color: rgba(22, 58, 107, 0.35) !important;
-        box-shadow: 0 3px 10px rgba(0,0,0,0.2);
-    }
+        background-color: var(--bg-card) !important;
+        box-shadow: var(--shadow-sm);
+    }}
 
-    .header-banner {
-        background: linear-gradient(135deg, var(--navy-light), var(--accent));
+    /* Banner principal */
+    .header-banner {{
+        background: linear-gradient(135deg, var(--bg-surface), var(--accent));
         padding: 22px 16px;
-        border-radius: 16px;
+        border-radius: 18px;
         text-align: center;
         margin-bottom: 20px;
-        box-shadow: 0 6px 16px rgba(0,0,0,0.3);
-    }
-    .header-banner img { max-height: 60px; margin-bottom: 6px; }
-    .header-banner h1 { color: #FFFFFF !important; margin: 0; font-size: 1.6rem; }
-    .header-banner p { color: #D7E0EC !important; margin: 4px 0 0 0; font-size: 0.9rem; }
+        box-shadow: var(--shadow-lg);
+    }}
+    .header-banner img {{ max-height: 60px; margin-bottom: 6px; }}
+    .header-banner h1 {{ color: #FFFFFF !important; margin: 0; font-size: 1.7rem; font-weight: 700; }}
+    .header-banner p {{ color: rgba(255,255,255,0.90) !important; margin: 4px 0 0 0; font-size: 0.92rem; }}
 
-    .wa-button {
+    /* Botón de WhatsApp */
+    .wa-button {{
         display: inline-block;
         width: 100%;
         box-sizing: border-box;
         text-align: center;
         background-color: var(--accent);
         color: #FFFFFF !important;
-        border-radius: 10px;
-        padding: 0.55em 1.2em;
+        border-radius: 999px;
+        padding: 0.65em 1.3em;
         font-weight: 600;
         text-decoration: none;
         margin-top: 8px;
-    }
-    .wa-button:hover { background-color: var(--accent-hover); }
+        transition: background-color .15s ease, transform .15s ease;
+    }}
+    .wa-button:hover {{ background-color: var(--accent-hover); transform: translateY(-1px); }}
 
-    /* Tarjetas de resumen estilo "Money Manager" */
-    .kpi-row {
+    /* Tarjetas KPI */
+    .kpi-row {{
         display: flex;
         gap: 12px;
         overflow-x: auto;
         padding-bottom: 6px;
         margin-bottom: 8px;
-    }
-    .kpi-grid {
+    }}
+    .kpi-grid {{
         display: grid;
         grid-template-columns: repeat(2, 1fr);
         gap: 12px;
         margin-bottom: 8px;
-    }
-    @media (max-width: 600px) {
-        .kpi-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
-        .kpi-card .kpi-value { font-size: 1.1rem; }
-    }
-    .kpi-card {
+    }}
+    @media (max-width: 600px) {{
+        .kpi-grid {{ grid-template-columns: repeat(2, 1fr); gap: 10px; }}
+        .kpi-card .kpi-value {{ font-size: 1.08rem; }}
+    }}
+    .kpi-card {{
         flex: 1 1 140px;
         min-width: 140px;
-        border-radius: 16px;
-        padding: 16px;
+        border-radius: 18px;
+        padding: 16px 18px;
         color: #FFFFFF;
-        box-shadow: 0 6px 14px rgba(0,0,0,0.3);
-    }
-    .kpi-grid .kpi-card {
-        flex: unset;
-        min-width: 0;
-    }
-    .kpi-card .kpi-label { font-size: 0.75rem; opacity: 0.9; }
-    .kpi-card .kpi-value {
-        font-size: 1.35rem;
+        box-shadow: var(--shadow-sm);
+    }}
+    .kpi-grid .kpi-card {{ flex: unset; min-width: 0; }}
+    .kpi-card .kpi-label {{ font-size: 0.78rem; opacity: 0.92; font-weight: 500; }}
+    .kpi-card .kpi-value {{
+        font-size: 1.45rem;
         font-weight: 700;
-        margin-top: 4px;
+        margin-top: 6px;
         word-break: break-word;
         overflow-wrap: break-word;
-    }
-    .kpi-blue { background: linear-gradient(135deg, var(--navy-light), var(--accent)); }
-    .kpi-green { background: linear-gradient(135deg, #0F6A4C, var(--green)); }
-    .kpi-orange { background: linear-gradient(135deg, #8A5A12, var(--orange)); }
-    .kpi-red { background: linear-gradient(135deg, #7A1F2B, var(--red)); }
+    }}
+    .kpi-blue   {{ background: linear-gradient(135deg, #1E4E94, #2F6FD6); }}
+    .kpi-green  {{ background: linear-gradient(135deg, #10714F, #2BBF8B); }}
+    .kpi-orange {{ background: linear-gradient(135deg, #8F5E10, #EBA945); }}
+    .kpi-red    {{ background: linear-gradient(135deg, #7E2131, #DC5A70); }}
 
-    /* Chips de resumen por categoría */
-    .chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 4px 0; }
-    .chip {
-        background: var(--navy-light);
+    /* Chips de categorías */
+    .chip-row {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 4px 0; }}
+    .chip {{
+        background: var(--bg-soft);
         border: 1px solid var(--border);
-        color: var(--text-light);
-        padding: 4px 12px;
+        color: var(--text);
+        padding: 6px 14px;
+        border-radius: 999px;
+        font-size: 0.80rem;
+        font-weight: 500;
+    }}
+
+    /* Alertas / Toasts adaptados al tema */
+    [data-testid="stAlert"] {{
+        overflow: hidden;
+        border-radius: 14px !important;
+        border: 1px solid var(--border) !important;
+        box-shadow: var(--shadow-sm) !important;
+    }}
+    [data-testid="stAlertContainer"],
+    [data-testid="stAlertContainer"] > div {{
+        border: none !important;
+        box-shadow: none !important;
+    }}
+    [data-testid="stToast"] {{
+        background-color: var(--bg-card) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 14px !important;
+    }}
+
+    /* Divisor minimalista */
+    [data-testid="stMarkdownContainer"] hr,
+    hr {{
+        border: none !important;
+        border-top: 1px solid var(--border) !important;
+        background: none !important;
+        margin: 1.2em 0 !important;
+    }}
+
+    /* Checkbox / radio */
+    [data-testid="stCheckbox"] label,
+    [data-testid="stRadio"] label {{ color: var(--text) !important; }}
+
+    /* Radio HORIZONTAL del selector de tema */
+    div[data-testid="stRadio"] [role="radiogroup"] {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        background: var(--bg-soft);
+        padding: 6px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        box-shadow: var(--shadow-sm);
+    }}
+    div[data-testid="stRadio"] [role="radiogroup"] label {{
+        flex: 1;
+        min-width: 0;
+        padding: 6px 10px !important;
+        border-radius: 999px;
+        cursor: pointer;
+        font-weight: 500 !important;
+        transition: all .15s ease;
+    }}
+    div[data-testid="stRadio"] [role="radiogroup"] label:hover {{
+        background-color: var(--accent-bg) !important;
+        color: var(--text) !important;
+    }}
+    /* Radio SELECCIONADO */
+    div[data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) {{
+        background: var(--accent) !important;
+        color: #FFFFFF !important;
+        box-shadow: 0 3px 8px var(--accent-bg);
+        font-weight: 600 !important;
+    }}
+    /* Ocultar el círculo nativo del radio (estilo píldora) */
+    div[data-testid="stRadio"] [role="radiogroup"] input[type="radio"] {{
+        display: none !important;
+    }}
+
+    /* ==================== PÍLDORAS: inputs y selectores ==================== */
+    /* Todos los campos de una línea son redondeados (el área de texto, menos). */
+    div[data-baseweb="input"],
+    div[data-baseweb="select"] > div,
+    [data-testid="stTextInputRootElement"],
+    [data-testid="stNumberInputContainer"],
+    [data-testid="stDateInputField"],
+    [data-testid="stSelectbox"] div[role="group"] {{ border-radius: 999px !important; }}
+    div[data-baseweb="textarea"],
+    [data-testid="stTextAreaRootElement"] {{ border-radius: 20px !important; }}
+    div[data-baseweb="input"] input,
+    [data-testid="stTextInputRootElement"] input,
+    [data-testid="stNumberInputContainer"] input,
+    [data-testid="stDateInputField"] input {{ padding-left: 18px !important; padding-right: 18px !important; }}
+
+    /* ==================== CONCEPTOS: tarjetas con campos tipo píldora ==================== */
+    /* Cada concepto es una tarjeta (st.container con key "concepto_<uid>") con dos
+       filas: [descripción | quitar] y [cantidad | precio | total]. Las filas NO se
+       apilan en el celular: se fuerza flex-wrap: nowrap. */
+    [class*="st-key-concepto_"],
+    [class*="st-key-concepto_"] [data-testid="stVerticalBlock"] {{ gap: 0.55rem !important; }}
+
+    [class*="st-key-cdesc_"] [data-testid="stHorizontalBlock"],
+    [class*="st-key-cnums_"] [data-testid="stHorizontalBlock"],
+    [class*="st-key-adic_"] [data-testid="stHorizontalBlock"] {{
+        flex-wrap: nowrap !important;
+        gap: 0.6rem !important;
+    }}
+    [class*="st-key-cdesc_"] [data-testid="stColumn"],
+    [class*="st-key-cnums_"] [data-testid="stColumn"],
+    [class*="st-key-adic_"] [data-testid="stColumn"] {{ min-width: 0 !important; }}
+
+    /* Descripción: ocupa todo el ancho. Botón quitar: ancho fijo. */
+    [class*="st-key-cdesc_"] [data-testid="stColumn"]:first-child,
+    [class*="st-key-adic_"] [data-testid="stColumn"]:first-child {{ flex: 1 1 0 !important; width: auto !important; }}
+    [class*="st-key-cdesc_"] [data-testid="stColumn"]:last-child,
+    [class*="st-key-adic_"] [data-testid="stColumn"]:last-child {{ flex: 0 0 3rem !important; width: 3rem !important; }}
+    /* Cantidad angosta; precio y total más anchos. */
+    [class*="st-key-cnums_"] [data-testid="stColumn"]:nth-child(1) {{ flex: 0.8 1 0 !important; width: auto !important; }}
+    [class*="st-key-cnums_"] [data-testid="stColumn"]:nth-child(2),
+    [class*="st-key-cnums_"] [data-testid="stColumn"]:nth-child(3) {{ flex: 1.5 1 0 !important; width: auto !important; }}
+    /* Adicionales (Configuración): precio con ancho fijo. */
+    [class*="st-key-adic_"] [data-testid="stColumn"]:nth-child(2) {{ flex: 0 0 8.5rem !important; width: 8.5rem !important; }}
+
+    /* Sin botones +/- dentro de las tarjetas: más lugar para escribir. */
+    [class*="st-key-concepto_"] [data-testid="stNumberInputStepUp"],
+    [class*="st-key-concepto_"] [data-testid="stNumberInputStepDown"],
+    [class*="st-key-adic_"] [data-testid="stNumberInputStepUp"],
+    [class*="st-key-adic_"] [data-testid="stNumberInputStepDown"] {{ display: none !important; }}
+
+    /* Etiquetas chicas y discretas */
+    [class*="st-key-concepto_"] [data-testid="stWidgetLabel"] p,
+    [class*="st-key-adic_"] [data-testid="stWidgetLabel"] p {{
+        font-size: 0.76rem !important;
+        color: var(--text-muted) !important;
+        margin-bottom: 0 !important;
+    }}
+
+    /* Total de cada concepto (campo de solo lectura, alineado a la derecha) */
+    [class*="st-key-c_tot_"] input {{
+        text-align: right;
+        font-weight: 700 !important;
+        opacity: 1 !important;
+        -webkit-text-fill-color: var(--text) !important;
+    }}
+    [class*="st-key-c_tot_"] div[data-baseweb="input"],
+    [class*="st-key-c_tot_"] [data-testid="stTextInputRootElement"] {{ background-color: var(--accent-bg) !important; }}
+    @media (max-width: 640px) {{
+        [class*="st-key-c_tot_"] input {{ font-size: 0.86rem !important; padding-left: 8px !important; padding-right: 12px !important; }}
+    }}
+
+    /* Botón de quitar (solo el ícono, rojo, sin fondo) */
+    [class*="st-key-quitar"] [data-testid="stMarkdownContainer"] {{ display: none !important; }}
+    div[class*="st-key-quitar"] div.stButton button[kind] {{
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        min-height: 46px;
+        width: 100%;
+        padding: 0 !important;
+        border-radius: 999px !important;
+    }}
+    div[class*="st-key-quitar"] div.stButton button[kind] * {{ color: var(--red) !important; }}
+    div[class*="st-key-quitar"] div.stButton button[kind]:hover {{
+        background: rgba(209, 68, 92, 0.16) !important;
+        transform: none !important;
+    }}
+
+    /* Botón de "añadir": contorno punteado */
+    div[class*="st-key-btn_add"] div.stButton button[kind] {{
+        background: transparent !important;
+        border: 1.5px dashed var(--accent) !important;
+        box-shadow: none !important;
+    }}
+    div[class*="st-key-btn_add"] div.stButton button[kind]:hover {{ background: var(--accent-bg) !important; }}
+
+    /* Mensaje de lista vacía */
+    .vacio {{
+        border: 1.5px dashed var(--border);
+        border-radius: 18px;
+        padding: 22px 16px;
+        text-align: center;
+        font-size: 0.92rem;
+        margin-bottom: 0.6rem;
+    }}
+    .vacio, .vacio * {{ color: var(--text-muted) !important; }}
+
+    /* ==================== RESUMEN DEL PRESUPUESTO ==================== */
+    .resumen {{
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        padding: 16px 20px 20px 20px;
+        box-shadow: var(--shadow-sm);
+    }}
+    .resumen-fila {{ display: flex; justify-content: space-between; padding: 6px 4px; font-size: 0.95rem; }}
+    .resumen-fila, .resumen-fila * {{ color: var(--text-soft) !important; }}
+    .resumen-total {{
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin-top: 10px;
+        padding: 14px 22px;
+        border-radius: 999px;
+        background: var(--accent);
+        font-size: 1.15rem;
+        font-weight: 700;
+    }}
+    .resumen-total, .resumen-total * {{ color: #FFFFFF !important; }}
+
+    /* ==================== ESTADOS (píldoras de color) ==================== */
+    .estado-pill {{
+        display: inline-block;
+        padding: 3px 12px;
         border-radius: 999px;
         font-size: 0.78rem;
-    }
+        font-weight: 600;
+        border: 1px solid transparent;
+        vertical-align: middle;
+    }}
+    .estado-pendiente  {{ background: rgba(224, 151, 43, 0.16); border-color: rgba(224, 151, 43, 0.55); }}
+    .estado-pill.estado-pendiente, .estado-pill.estado-pendiente * {{ color: var(--orange) !important; }}
+    .estado-aprobado   {{ background: rgba(31, 169, 122, 0.16); border-color: rgba(31, 169, 122, 0.55); }}
+    .estado-pill.estado-aprobado, .estado-pill.estado-aprobado * {{ color: var(--green) !important; }}
+    .estado-rechazado  {{ background: rgba(209, 68, 92, 0.16); border-color: rgba(209, 68, 92, 0.55); }}
+    .estado-pill.estado-rechazado, .estado-pill.estado-rechazado * {{ color: var(--red) !important; }}
+    .estado-completado {{ background: var(--accent-bg); border-color: var(--accent); }}
+    .estado-pill.estado-completado, .estado-pill.estado-completado * {{ color: var(--accent-hover) !important; }}
 
-    /* ===== Tablas: st.data_editor y st.dataframe (estilo "no-Excel", más prolijo) ===== */
-    [data-testid="stDataEditor"],
-    [data-testid="stDataFrame"] {
-        border: 1.5px solid var(--border) !important;
-        border-radius: 14px !important;
-        background-color: var(--navy-light) !important;
-        padding: 4px 4px 6px 4px;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.22);
-        overflow: hidden;
-    }
-    /* Encabezados (fila superior) */
-    [data-testid="stDataEditor"] [data-testid="stTableStyledTableHeader"],
-    [data-testid="stDataFrame"] [data-testid="stTableStyledTableHeader"],
-    [data-testid="stDataEditor"] .glideDataEditor .dvn-scroller .gde-header,
-    [data-testid="stDataFrame"] .glideDataEditor .dvn-scroller .gde-header {
-        background: linear-gradient(180deg, #1F4A83, #12335E) !important;
-        color: #FFFFFF !important;
-        font-weight: 700 !important;
-        font-size: 0.95rem !important;
-        border-bottom: 2px solid var(--accent) !important;
-    }
-    /* Celdas: altura, padding y bordes suaves */
-    [data-testid="stDataEditor"] .glideDataEditor .dvn-scroller,
-    [data-testid="stDataFrame"] .glideDataEditor .dvn-scroller,
-    [data-testid="stDataEditor"] [data-testid="stTableStyledTableCellContent"],
-    [data-testid="stDataFrame"] [data-testid="stTableStyledTableCellContent"] {
-        font-family: 'Inter', sans-serif !important;
-        font-size: 0.92rem !important;
-    }
-    /* Filas alternadas para no perder de vista la línea */
-    [data-testid="stDataEditor"] .gdt-Row:nth-child(even),
-    [data-testid="stDataFrame"] .gdt-Row:nth-child(even) {
-        background-color: rgba(47, 111, 214, 0.08) !important;
-    }
-    [data-testid="stDataEditor"] .gdt-Row:hover,
-    [data-testid="stDataFrame"] .gdt-Row:hover {
-        background-color: rgba(76, 140, 240, 0.14) !important;
-    }
-    /* Bordes interiores entre celdas */
-    [data-testid="stDataEditor"] .gdt-Cell,
-    [data-testid="stDataFrame"] .gdt-Cell {
-        border-bottom: 1px solid rgba(88, 124, 173, 0.35) !important;
-        border-right: 1px solid rgba(88, 124, 173, 0.25) !important;
-        padding: 6px 10px !important;
-        min-height: 44px !important;
-    }
-    /* Celda seleccionada (borde azul fuerte y claro) */
-    [data-testid="stDataEditor"] .gdt-Cell[aria-selected="true"],
-    [data-testid="stDataFrame"] .gdt-Cell[aria-selected="true"],
-    [data-testid="stDataEditor"] .gde-selected,
-    [data-testid="stDataFrame"] .gde-selected {
-        outline: 2px solid var(--accent-hover) !important;
-        outline-offset: -2px;
-        background-color: rgba(47, 111, 214, 0.18) !important;
-        border-radius: 4px;
-    }
-    /* Inputs DENTRO de la tabla cuando estás editando */
-    [data-testid="stDataEditor"] input,
-    [data-testid="stDataEditor"] textarea,
-    [data-testid="stDataEditor"] select {
-        border-radius: 8px !important;
-        padding: 6px 10px !important;
-    }
-    /* Scrollbar más limpio dentro de tablas */
-    [data-testid="stDataEditor"] .dvn-scroll-inner::-webkit-scrollbar,
-    [data-testid="stDataFrame"] .dvn-scroll-inner::-webkit-scrollbar {
-        width: 10px;
-        height: 10px;
-    }
-    [data-testid="stDataEditor"] .dvn-scroll-inner::-webkit-scrollbar-thumb,
-    [data-testid="stDataFrame"] .dvn-scroll-inner::-webkit-scrollbar-thumb {
-        background: #2A5A9A;
+    .hist-titulo {{ font-weight: 600; font-size: 1.02rem; margin-bottom: 2px; }}
+    .hist-detalle {{ font-size: 0.88rem; }}
+    .hist-detalle, .hist-detalle * {{ color: var(--text-soft) !important; }}
+
+    /* ==================== RANKING (Top clientes) ==================== */
+    .rank-row {{
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        background: var(--bg-card);
+        border: 1px solid var(--border);
         border-radius: 999px;
-    }
-    [data-testid="stDataEditor"] .dvn-scroll-inner::-webkit-scrollbar-track,
-    [data-testid="stDataFrame"] .dvn-scroll-inner::-webkit-scrollbar-track {
-        background: rgba(11, 37, 69, 0.6);
-    }
+        padding: 9px 20px 9px 10px;
+        margin-bottom: 8px;
+    }}
+    .rank-pos {{
+        width: 30px;
+        height: 30px;
+        border-radius: 999px;
+        background: var(--accent-bg);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 700;
+        font-size: 0.85rem;
+        flex: 0 0 30px;
+    }}
+    .rank-name {{ flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .rank-total {{ font-weight: 700; white-space: nowrap; }}
+
+    /* ==================== ARREGLOS DE COMPONENTES NATIVOS ==================== */
+    /* Botones con tooltip (help=) quedan envueltos y perdían el estilo: se reafirma por data-testid. */
+    button[data-testid="stBaseButton-secondary"] {{
+        background-color: var(--bg-soft) !important;
+        color: var(--text) !important;
+        border: 1.5px solid var(--border) !important;
+        border-radius: 999px !important;
+        box-shadow: none !important;
+    }}
+    button[data-testid="stBaseButton-secondary"]:hover:not(:disabled) {{
+        background-color: var(--accent-bg) !important;
+        border-color: var(--accent) !important;
+    }}
+    button[data-testid="stBaseButton-primary"] {{
+        background-color: var(--accent) !important;
+        color: #FFFFFF !important;
+        border: none !important;
+        border-radius: 999px !important;
+    }}
+    button[data-testid="stBaseButton-primary"]:hover:not(:disabled) {{ background-color: var(--accent-hover) !important; }}
+    button:disabled {{ opacity: 0.45 !important; }}
+
+    /* Texto de campos y desplegables siempre legible (no depende del tema base de Streamlit). */
+    input, textarea {{ color: var(--text) !important; caret-color: var(--text); }}
+
+    /* Pestañas: sin la rayita roja de la pestaña activa (la píldora ya la marca). */
+    [data-testid="stTab"] > div:not([data-testid="stMarkdownContainer"]) {{ display: none !important; }}
+
+    /* Selector de tema: sin círculos de radio, solo píldoras. */
+    div[data-testid="stRadio"] label[data-testid="stRadioOption"] > div > div:first-child {{ display: none !important; }}
+    div[data-testid="stRadio"] label[data-testid="stRadioOption"] {{ justify-content: center; }}
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -1011,7 +1523,6 @@ with st.sidebar:
 
     st.caption("El código no es una contraseña: cualquiera que lo conozca puede ver esos datos.")
 
-
 # ============================================================
 # ENCABEZADO
 # ============================================================
@@ -1019,13 +1530,45 @@ def mostrar_banner():
     empresa = st.session_state.empresa
     logo_uri = logo_base64_uri(empresa.get("logo_path", ""))
     logo_html = f'<img src="{logo_uri}" />' if logo_uri else ""
-    nombre = empresa.get("nombre", "")
-    subtitulo = subtitulo_empresa(empresa)
+    nombre = esc(empresa.get("nombre", ""))
+    subtitulo = esc(subtitulo_empresa(empresa))
     banner_html = f'<div class="header-banner">{logo_html}<h1>{nombre}</h1><p>{subtitulo}</p></div>'
     st.markdown(banner_html, unsafe_allow_html=True)
 
 
 mostrar_banner()
+
+# ============================================================
+# SELECTOR DE TEMA (Azul Marino / Oscuro)
+# st.radio horizontal estilizado a píldora (sin JS observers). Los colores se
+# toman de session_state.tema_actual en cada rerun y se inyectan via f-string
+# en :root (el bloque CSS de arriba).
+# ============================================================
+_claves_temas = list(TEMAS_DISPONIBLES.keys())
+_etiquetas_temas = [TEMAS_DISPONIBLES[k]["label"] for k in _claves_temas]
+
+# Si quedó guardada una opción vieja (ej: "Claro" de una versión anterior), se descarta.
+if st.session_state.get("selector_tema_radio") not in _etiquetas_temas:
+    st.session_state.pop("selector_tema_radio", None)
+
+_, col_tema = st.columns([2, 3])
+with col_tema:
+    _sel_label = st.radio(
+        "Diseño visual",
+        _etiquetas_temas,
+        index=_claves_temas.index(_TEMA_ACTUAL),
+        label_visibility="collapsed",
+        horizontal=True,
+        key="selector_tema_radio",
+    )
+    # Si cambió la opción -> actualizamos y forzamos rerun para que el
+    # bloque CSS (arriba del todo) re-injecte las variables del nuevo tema.
+    _nuevo_tema = _claves_temas[_etiquetas_temas.index(_sel_label)]
+    if _nuevo_tema != _TEMA_ACTUAL:
+        st.session_state.tema_actual = _nuevo_tema
+        st.rerun()
+
+st.divider()
 
 st.info(
     "Versión de prueba: usá datos de ejemplo, no de clientes reales. "
@@ -1044,6 +1587,11 @@ tab_nuevo, tab_panel, tab_config, tab_historial, tab_pro = st.tabs(
 # TAB 0: NUEVO PRESUPUESTO
 # ------------------------------------------------------------
 with tab_nuevo:
+    # Si el presupuesto anterior se generó, se vacía la lista de conceptos acá,
+    # ANTES de dibujar los campos (después de dibujarlos Streamlit no deja tocarlos).
+    if st.session_state.pop("vaciar_conceptos_pendiente", False):
+        vaciar_conceptos()
+
     # --- Rubro / Actividad: visible de entrada, arriba de todo ---
     opciones_rubro = list(RUBROS.keys())
     rubro_guardado = st.session_state.empresa.get("rubro", "Aire Acondicionado")
@@ -1060,10 +1608,6 @@ with tab_nuevo:
     config_rubro = config_del_rubro(rubro_actual)
     categorias_actuales = config_rubro["categorias"]
     servicios_actuales = config_rubro["servicios"]
-
-    # Si la categoría guardada ya no pertenece al rubro, vuelve a la primera.
-    if st.session_state.get("item_categoria") not in categorias_actuales:
-        st.session_state.item_categoria = categorias_actuales[0]
 
     st.subheader("Datos del Cliente")
     cliente_nombre = st.text_input("Nombre y Apellido", key="cliente_nombre_input")
@@ -1093,44 +1637,113 @@ with tab_nuevo:
         fecha = st.date_input("Fecha", value=date.today())
 
     st.divider()
-    st.subheader("Detalle del Trabajo")
+    st.subheader("Conceptos")
 
-    # Al elegir un servicio, al_elegir_servicio() rellena los campos de abajo.
-    opciones_serv = [OPCION_PERSONALIZADO] + [s["descripcion"] for s in servicios_actuales]
-    if st.session_state.servicio_sel not in opciones_serv:
-        st.session_state.servicio_sel = OPCION_PERSONALIZADO
-    st.selectbox(
-        "Servicio predefinido (opcional)",
-        opciones_serv,
-        key="servicio_sel",
-        on_change=al_elegir_servicio,
-    )
-
-    st.selectbox("Categoría", categorias_actuales, key="item_categoria")
-    st.text_input("Descripción del concepto", key="item_descripcion", max_chars=80)
-    col1, col2 = st.columns(2)
-    with col1:
-        st.number_input("Cantidad", min_value=1, max_value=50, step=1, key="item_cantidad")
-    with col2:
-        st.number_input(
-            "Precio unitario ($)",
-            min_value=0.0,
-            max_value=100000000.0,
-            step=100.0,
-            format="%.2f",
-            key="item_precio",
+    # --- Una tarjeta por concepto (campos redondeados, sin tabla tipo Excel) ---
+    # Los valores se leen de los propios campos: `items` es la lista "real" del
+    # presupuesto en esta pasada del script.
+    items = []
+    if not st.session_state.conceptos:
+        st.markdown(
+            '<div class="vacio">Todavía no hay conceptos. Sumá uno con el botón '
+            '"Añadir concepto" o elegí un servicio predefinido.</div>',
+            unsafe_allow_html=True,
         )
-    st.button("Agregar ítem", on_click=agregar_item, width="stretch")
 
-    aviso_item = st.session_state.pop("aviso_item", None)
-    if aviso_item:
-        tipo, texto = aviso_item
-        (st.success if tipo == "ok" else st.error)(texto)
+    for uid in list(st.session_state.conceptos):
+        # Si la categoría del concepto no existe en este rubro (ej: se duplicó un
+        # presupuesto de otro rubro), se suma a las opciones para no perderla.
+        categoria_guardada = st.session_state.get(f"c_cat_{uid}", CATEGORIA_POR_DEFECTO)
+        opciones_categoria = list(categorias_actuales)
+        if categoria_guardada not in opciones_categoria:
+            opciones_categoria.append(categoria_guardada)
 
-    # --- Adicionales rápidos (se editan en "Configuración del Negocio") ---
-    st.caption("Adicionales rápidos")
+        with st.container(border=True, key=f"concepto_{uid}"):
+            with st.container(key=f"cdesc_{uid}"):
+                col_desc, col_quitar = st.columns([8, 1], vertical_alignment="bottom")
+                with col_desc:
+                    descripcion = st.text_input(
+                        "Descripción",
+                        key=f"c_desc_{uid}",
+                        max_chars=100,
+                        placeholder="Descripción del concepto",
+                        label_visibility="collapsed",
+                    )
+                with col_quitar:
+                    st.button(
+                        "Quitar",
+                        key=f"quitar_{uid}",
+                        icon=":material/close:",
+                        type="tertiary",
+                        on_click=quitar_concepto,
+                        args=(uid,),
+                    )
+
+            with st.container(key=f"cnums_{uid}"):
+                col_cant, col_prec, col_tot = st.columns([1, 2, 2])
+                with col_cant:
+                    cantidad = st.number_input(
+                        "Cant.", min_value=0.01, max_value=100000.0, step=1.0, format="%g", key=f"c_cant_{uid}",
+                    )
+                with col_prec:
+                    precio = st.number_input(
+                        "Precio unitario ($)", min_value=0.0, max_value=100000000.0, step=100.0,
+                        format="%.2f", key=f"c_prec_{uid}",
+                    )
+                # Si el campo queda vacío, Streamlit devuelve None: se toma el valor mínimo.
+                cantidad = float(cantidad or 1.0)
+                precio = float(precio or 0.0)
+                subtotal_fila = cantidad * precio
+                with col_tot:
+                    # Campo de solo lectura: se actualiza solo con cantidad x precio.
+                    st.session_state[f"c_tot_{uid}"] = moneda(subtotal_fila)
+                    st.text_input("Total", key=f"c_tot_{uid}", disabled=True)
+
+            categoria = st.selectbox(
+                "Categoría", opciones_categoria, key=f"c_cat_{uid}", label_visibility="collapsed",
+            )
+
+        items.append({
+            "categoria": categoria,
+            "descripcion": (descripcion or "").strip(),
+            "cantidad": cantidad,
+            "precio_unitario": precio,
+            "subtotal": subtotal_fila,
+        })
+
+    col_agregar, col_vaciar = st.columns([3, 1])
+    with col_agregar:
+        st.button(
+            "Añadir concepto",
+            key="btn_add_concepto",
+            icon=":material/add:",
+            on_click=agregar_concepto_vacio,
+            width="stretch",
+        )
+    with col_vaciar:
+        st.button(
+            "Vaciar lista",
+            key="btn_vaciar",
+            on_click=vaciar_conceptos,
+            width="stretch",
+            help="Quita todos los conceptos de la lista (no se puede deshacer).",
+            disabled=not items,
+        )
+
+    # --- Agregar más rápido: servicios predefinidos y adicionales ---
+    if servicios_actuales:
+        st.selectbox(
+            "Agregar un servicio predefinido",
+            [s["descripcion"] for s in servicios_actuales],
+            index=None,
+            placeholder="Elegí un servicio para sumarlo a la lista",
+            key="servicio_sel",
+            on_change=agregar_servicio_predefinido,
+        )
+
     adicionales = st.session_state.empresa.get("adicionales", [])
     if adicionales:
+        st.caption("Adicionales rápidos (se editan en \"Configuración del Negocio\")")
         # Se acomodan de a 3 por fila, sin importar cuántos haya.
         for inicio in range(0, len(adicionales), 3):
             fila = adicionales[inicio:inicio + 3]
@@ -1144,90 +1757,22 @@ with tab_nuevo:
                         width="stretch",
                     )
     else:
-        st.caption('No hay adicionales cargados. Podés crearlos en "Configuración del Negocio".')
+        st.caption('No hay adicionales rápidos cargados. Podés crearlos en "Configuración del Negocio".')
 
-    # --- Tabla editable de ítems ---
-    st.write("Ítems del presupuesto (editable directamente en la tabla)")
-    columnas_items = ["categoria", "descripcion", "cantidad", "precio_unitario", "subtotal"]
-    if st.session_state.lista_items:
-        df_items_edit = pd.DataFrame(st.session_state.lista_items)[columnas_items]
-    else:
-        df_items_edit = pd.DataFrame(columns=columnas_items)
-
-    # Si hay ítems de otro rubro (ej: se cambió el rubro a mitad de presupuesto),
-    # sus categorías se suman a las opciones para que la tabla no las pierda.
-    categorias_en_uso = {i["categoria"] for i in st.session_state.lista_items}
-    opciones_categoria = categorias_actuales + sorted(c for c in categorias_en_uso if c not in categorias_actuales)
-
-    # Anchos fijos adaptados: descripción y categoría con más espacio,
-    # cantidad angosta, precios con ancho suficiente para no cortar.
-    edited_df = st.data_editor(
-        df_items_edit,
-        num_rows="dynamic",
-        width="stretch",
-        hide_index=True,
-        key=f"editor_items_{st.session_state.reset_counter}",
-        column_config={
-            "categoria": st.column_config.SelectboxColumn(
-                "Categoría", options=opciones_categoria, width="medium", required=True,
-            ),
-            "descripcion": st.column_config.TextColumn(
-                "Descripción", width="large", required=True, max_chars=100,
-            ),
-            "cantidad": st.column_config.NumberColumn(
-                "Cant.", min_value=1, step=1, width="small", required=True,
-            ),
-            "precio_unitario": st.column_config.NumberColumn(
-                "P. Unitario ($)", min_value=0.0, format="$ %.2f", width="medium", required=True,
-            ),
-            "subtotal": st.column_config.NumberColumn(
-                "Subtotal", format="$ %.2f", disabled=True, width="medium",
-            ),
-        },
-    )
-
-    # Se completan los vacíos (filas nuevas) y se recalcula el subtotal.
-    edited_df["cantidad"] = pd.to_numeric(edited_df["cantidad"], errors="coerce").fillna(1).clip(lower=1).astype(int)
-    edited_df["precio_unitario"] = pd.to_numeric(edited_df["precio_unitario"], errors="coerce").fillna(0.0)
-    edited_df["subtotal"] = edited_df["cantidad"] * edited_df["precio_unitario"]
-    edited_df["categoria"] = edited_df["categoria"].fillna(categorias_actuales[0]).replace({"None": categorias_actuales[0], None: categorias_actuales[0]})
-    edited_df["descripcion"] = edited_df["descripcion"].fillna("").replace({"None": "", None: ""}).astype(str)
-    edited_df["descripcion"] = edited_df["descripcion"].str.strip()
-    st.session_state.lista_items = edited_df.to_dict("records")
-
-    # Botones de limpieza / eliminación de filas (por si agregaste filas sin querer)
-    col_btn1, col_btn2 = st.columns(2)
-    with col_btn1:
-        st.button(
-            "🧹 Quitar filas vacías",
-            on_click=eliminar_filas_vacias,
-            width="stretch",
-            help="Elimina las filas que tienen descripción vacía o precio 0.",
-            disabled=not st.session_state.lista_items,
-        )
-    with col_btn2:
-        st.button(
-            "🗑️ Limpiar todos los ítems",
-            on_click=limpiar_items,
-            width="stretch",
-            help="Borra TODOS los ítems de la lista (no se puede deshacer).",
-            disabled=not st.session_state.lista_items,
-        )
-    st.caption(
-        "Tip: en la tabla también podés seleccionar una fila y apretar la tecla Supr/Delete "
-        "para borrarla directamente."
-    )
+    aviso_item = st.session_state.pop("aviso_item", None)
+    if aviso_item:
+        (st.success if aviso_item[0] == "ok" else st.error)(aviso_item[1])
 
     # Resumen por categoría hecho "a mano" con un diccionario común.
     # (En la pestaña Panel hacemos lo mismo con pandas groupby, que
     # conviene cuando hay muchos datos acumulados en el historial).
-    if st.session_state.lista_items:
+    if items:
         resumen_por_categoria = {}
-        for it in st.session_state.lista_items:
+        for it in items:
             resumen_por_categoria[it["categoria"]] = resumen_por_categoria.get(it["categoria"], 0) + it["subtotal"]
 
         chips_html = "".join(
-            f'<span class="chip">{cat}: $ {monto:,.0f}</span>'
+            f'<span class="chip">{esc(cat)}: {moneda(monto, 0)}</span>'
             for cat, monto in resumen_por_categoria.items()
         )
         st.markdown(f'<div class="chip-row">{chips_html}</div>', unsafe_allow_html=True)
@@ -1257,31 +1802,43 @@ with tab_nuevo:
         help=f"Máximo {MAX_CHARS_NOTAS} caracteres, para que el PDF quede prolijo.",
     )
 
-    subtotal = sum(i["subtotal"] for i in st.session_state.lista_items)
+    subtotal = sum(i["subtotal"] for i in items)
     descuento_monto = subtotal * (descuento_pct / 100)
     total = subtotal - descuento_monto + envio
 
     st.divider()
-    metrics_html = (
-        '<div class="kpi-grid">'
-        + kpi_card("Subtotal", f"$ {subtotal:,.2f}", "kpi-blue")
-        + kpi_card("Descuento", f"$ {descuento_monto:,.2f}", "kpi-orange")
-        + kpi_card("Envío", f"$ {envio:,.2f}", "kpi-green")
-        + kpi_card("Total Cotizado", f"$ {total:,.2f}", "kpi-red")
-        + "</div>"
+    st.subheader("Resumen")
+    # Todo en una sola línea (sin sangrías) para que Streamlit lo tome como HTML.
+    resumen_html = (
+        '<div class="resumen">'
+        f'<div class="resumen-fila"><span>Subtotal</span><span>{moneda(subtotal)}</span></div>'
     )
-    st.markdown(metrics_html, unsafe_allow_html=True)
+    if descuento_monto > 0:
+        resumen_html += (
+            f'<div class="resumen-fila"><span>Descuento ({descuento_pct:g}%)</span>'
+            f'<span>-{moneda(descuento_monto)}</span></div>'
+        )
+    if envio > 0:
+        resumen_html += f'<div class="resumen-fila"><span>Envío / Desplazamiento</span><span>{moneda(envio)}</span></div>'
+    resumen_html += (
+        f'<div class="resumen-total"><span>Total cotizado</span><span>{moneda(total)}</span></div>'
+        '</div>'
+    )
+    st.markdown(resumen_html, unsafe_allow_html=True)
 
-    st.divider()
+    st.write("")
 
     if st.button("Generar PDF", type="primary", width="stretch"):
         errores = []
         if not cliente_nombre.strip():
             errores.append("Falta el nombre del cliente.")
-        if not st.session_state.lista_items:
-            errores.append("Agregá al menos un ítem al presupuesto.")
-        elif any(not str(i["descripcion"]).strip() for i in st.session_state.lista_items):
-            errores.append("Hay ítems sin descripción: completalos o borrá esas filas.")
+        if not items:
+            errores.append("Agregá al menos un concepto al presupuesto.")
+        else:
+            if any(not i["descripcion"] for i in items):
+                errores.append("Hay conceptos sin descripción: completalos o quitalos.")
+            if subtotal <= 0:
+                errores.append("Cargá el precio de al menos un concepto.")
 
         historial = cargar_historial()
         nuevo_id = int(numero_presupuesto)
@@ -1296,12 +1853,12 @@ with tab_nuevo:
             items_limpios = [
                 {
                     "categoria": str(i["categoria"]),
-                    "descripcion": str(i["descripcion"]).strip(),
-                    "cantidad": int(i["cantidad"]),
+                    "descripcion": i["descripcion"],
+                    "cantidad": float(i["cantidad"]),
                     "precio_unitario": float(i["precio_unitario"]),
                     "subtotal": float(i["subtotal"]),
                 }
-                for i in st.session_state.lista_items
+                for i in items
             ]
 
             presupuesto = {
@@ -1340,8 +1897,8 @@ with tab_nuevo:
                     "total": total,
                     "id": nuevo_id,
                 }
-                st.session_state.lista_items = []
-                st.session_state.reset_counter += 1
+                # La lista de conceptos se vacía en la próxima pasada (ver el inicio de esta pestaña).
+                st.session_state.vaciar_conceptos_pendiente = True
                 # Se guarda el aviso y se recarga: así el campo "N° de presupuesto"
                 # ya muestra el número siguiente. El aviso se muestra tras el botón.
                 st.session_state.aviso_generado = f"Presupuesto N° {nuevo_id:04d} generado y guardado."
@@ -1362,11 +1919,11 @@ with tab_nuevo:
             key="descarga_pdf_actual",
         )
 
-        telefono_cliente_wa = limpiar_telefono(st.session_state.get("pdf_actual_info", {}).get("cliente_telefono", ""))
+        telefono_cliente_wa = limpiar_telefono(info.get("cliente_telefono", ""))
         if telefono_cliente_wa:
             mensaje = (
                 f"Hola {info['cliente']}, te comparto el presupuesto N° {info['id']:04d} "
-                f"por un total de $ {info['total']:,.2f}. Cualquier consulta quedo a disposición."
+                f"por un total de {moneda(info['total'])}. Cualquier consulta quedo a disposición."
             )
             wa_url = f"https://wa.me/{telefono_cliente_wa}?text={quote(mensaje)}"
             st.markdown(
@@ -1397,8 +1954,8 @@ with tab_panel:
 
         cards_html = (
             '<div class="kpi-row">'
-            + kpi_card("Total cotizado histórico", f"$ {total_historico:,.0f}", "kpi-blue")
-            + kpi_card("Cotizado este mes", f"$ {total_mes:,.0f}", "kpi-green")
+            + kpi_card("Total cotizado histórico", moneda(total_historico, 0), "kpi-blue")
+            + kpi_card("Cotizado este mes", moneda(total_mes, 0), "kpi-green")
             + kpi_card("Pendientes", str(cantidad_pendientes), "kpi-orange")
             + kpi_card("Aprobados", str(cantidad_aprobados), "kpi-green")
             + "</div>"
@@ -1409,9 +1966,9 @@ with tab_panel:
         st.subheader("Presupuestado por mes")
         df_mensual = df_hist.groupby("mes", as_index=False)["total"].sum().sort_values("mes")
         fig_mensual = px.bar(df_mensual, x="mes", y="total", labels={"mes": "Mes", "total": "Total presupuestado"})
-        fig_mensual.update_traces(marker_color="#2F6FD6")
+        fig_mensual.update_traces(marker_color=_P["accent"])
         fig_mensual.update_xaxes(type="category")
-        st.plotly_chart(estilizar_grafico(fig_mensual), width="stretch", config=CONFIG_PLOTLY)
+        st.plotly_chart(estilizar_grafico(fig_mensual, prefijo_eje="y"), width="stretch", config=CONFIG_PLOTLY)
 
         col_a, col_b = st.columns(2)
         with col_a:
@@ -1436,7 +1993,9 @@ with tab_panel:
                     color_discrete_sequence=PALETA_GRAFICOS,
                     labels={"subtotal": "Total", "categoria": ""},
                 )
-                st.plotly_chart(estilizar_grafico(fig_categoria), width="stretch", config=CONFIG_PLOTLY)
+                st.plotly_chart(
+                    estilizar_grafico(fig_categoria, prefijo_eje="x"), width="stretch", config=CONFIG_PLOTLY,
+                )
 
         st.subheader("Top clientes")
         df_top_clientes = (
@@ -1444,14 +2003,29 @@ with tab_panel:
             .sum()
             .sort_values("total", ascending=False)
             .head(5)
-            .rename(columns={"cliente": "Cliente", "total": "Total presupuestado"})
         )
-        st.dataframe(df_top_clientes, width="stretch", hide_index=True)
+        # Ranking en filas redondeadas (en vez de una tabla tipo planilla).
+        filas_ranking = "".join(
+            f'<div class="rank-row"><div class="rank-pos">{posicion}</div>'
+            f'<div class="rank-name">{esc(fila.cliente)}</div>'
+            f'<div class="rank-total">{moneda(fila.total)}</div></div>'
+            for posicion, fila in enumerate(df_top_clientes.itertuples(index=False), start=1)
+        )
+        st.markdown(filas_ranking, unsafe_allow_html=True)
 
 # ------------------------------------------------------------
 # TAB 2: CONFIGURACIÓN DEL NEGOCIO
 # ------------------------------------------------------------
 with tab_config:
+    # Tras guardar, se vuelven a armar las filas de adicionales desde lo guardado
+    # (así desaparecen las vacías). Va ANTES de dibujar los campos.
+    if st.session_state.pop("recargar_adicionales_pendiente", False):
+        cargar_filas_adicionales(st.session_state.empresa.get("adicionales", []))
+
+    aviso_config = st.session_state.pop("aviso_config", None)
+    if aviso_config:
+        st.success(aviso_config)
+
     st.subheader("Datos del Negocio")
     empresa = st.session_state.empresa
 
@@ -1460,9 +2034,15 @@ with tab_config:
 
     col1, col2 = st.columns(2)
     with col1:
-        telefono_emp = st.text_input("Teléfono", value=empresa.get("telefono", ""))
+        email_emp = st.text_input("Email de la empresa", value=empresa.get("email", ""), placeholder="Ej: tuempresa@gmail.com")
     with col2:
         zona_emp = st.text_input("Zona de cobertura", value=empresa.get("zona", ""))
+
+    web_emp = st.text_input(
+        "Página web (opcional)",
+        value=empresa.get("web", ""),
+        placeholder="Ej: www.tuempresa.com.ar",
+    )
 
     whatsapp_emp = st.text_input(
         "Número de WhatsApp para envíos (con código de país, sin +, ej: 5491122334455)",
@@ -1486,27 +2066,29 @@ with tab_config:
     st.subheader("Adicionales rápidos")
     st.caption(
         "Son los botones de un clic de la pestaña \"Nuevo Presupuesto\". "
-        "Editá las celdas, agregá filas al final o borrá las que no uses."
+        "Editalos, agregá los que quieras o quitá los que no uses, y después tocá \"Guardar cambios\"."
     )
-    adicionales_guardados = empresa.get("adicionales", ADICIONALES_RAPIDOS_GENERICOS)
-    df_adicionales = pd.DataFrame(
-        [{"descripcion": a["descripcion"], "precio": float(a["precio"])} for a in adicionales_guardados],
-        columns=["descripcion", "precio"],
-    )
-    adicionales_editados = st.data_editor(
-        df_adicionales,
-        num_rows="dynamic",
-        width="stretch",
-        hide_index=True,
-        key=f"editor_adicionales_{st.session_state.reset_counter}",
-        column_config={
-            "descripcion": st.column_config.TextColumn(
-                "Descripción", max_chars=80, width="large", required=True,
-            ),
-            "precio": st.column_config.NumberColumn(
-                "Precio ($)", min_value=0.0, format="$ %.2f", width="medium", required=True,
-            ),
-        },
+    for uid in list(st.session_state.adicionales_ids):
+        with st.container(key=f"adic_{uid}"):
+            col_ad_desc, col_ad_prec, col_ad_quitar = st.columns([5, 3, 1], vertical_alignment="bottom")
+            with col_ad_desc:
+                st.text_input(
+                    "Descripción", key=f"a_desc_{uid}", max_chars=80,
+                    placeholder="Descripción del adicional", label_visibility="collapsed",
+                )
+            with col_ad_prec:
+                st.number_input(
+                    "Precio ($)", min_value=0.0, max_value=100000000.0, step=100.0, format="%.2f",
+                    key=f"a_prec_{uid}", label_visibility="collapsed",
+                )
+            with col_ad_quitar:
+                st.button(
+                    "Quitar", key=f"quitarad_{uid}", icon=":material/close:", type="tertiary",
+                    on_click=quitar_fila_adicional, args=(uid,),
+                )
+    st.button(
+        "Añadir adicional", key="btn_add_adicional", icon=":material/add:",
+        on_click=agregar_fila_adicional, width="stretch",
     )
 
     st.subheader("Logo del Negocio")
@@ -1517,7 +2099,8 @@ with tab_config:
 
     if st.button("Guardar cambios", type="primary", width="stretch"):
         empresa["nombre"] = nombre_emp.strip()
-        empresa["telefono"] = telefono_emp.strip()
+        empresa["email"] = email_emp.strip()
+        empresa["web"] = web_emp.strip()
         empresa["zona"] = zona_emp.strip()
         empresa["whatsapp"] = whatsapp_emp.strip()
         empresa["validez_dias"] = validez_emp
@@ -1525,11 +2108,11 @@ with tab_config:
 
         # Se descartan las filas sin descripción; precio vacío = 0.
         adicionales_nuevos = []
-        for _, fila in adicionales_editados.iterrows():
-            descripcion_ad = str(fila["descripcion"]).strip() if pd.notna(fila["descripcion"]) else ""
-            precio_ad = float(fila["precio"]) if pd.notna(fila["precio"]) else 0.0
+        for uid in st.session_state.adicionales_ids:
+            descripcion_ad = str(st.session_state.get(f"a_desc_{uid}") or "").strip()
+            precio_ad = float(st.session_state.get(f"a_prec_{uid}") or 0.0)
             if descripcion_ad:
-                adicionales_nuevos.append({"categoria": "Otro", "descripcion": descripcion_ad, "precio": precio_ad})
+                adicionales_nuevos.append({"categoria": CATEGORIA_POR_DEFECTO, "descripcion": descripcion_ad, "precio": precio_ad})
         empresa["adicionales"] = adicionales_nuevos
 
         if logo_nuevo is not None:
@@ -1537,8 +2120,9 @@ with tab_config:
 
         st.session_state.empresa = empresa
         guardar_config(empresa)
-        st.session_state.reset_counter += 1  # refresca las tablas editables
-        st.success("Datos del negocio actualizados.")
+        # Se hace en la próxima pasada, porque ahora los campos ya están dibujados.
+        st.session_state.recargar_adicionales_pendiente = True
+        st.session_state.aviso_config = "Datos del negocio actualizados."
         st.rerun()
 
 # ------------------------------------------------------------
@@ -1588,20 +2172,25 @@ with tab_historial:
             st.warning("No se encontraron presupuestos con esos filtros.")
 
         for p in filtrados:
+            estado_p = p.get("estado", "Pendiente")
             with st.container(border=True):
-                st.write(f"N° {p['id']:04d} — {p['cliente_nombre']}")
-                st.write(f"{p['fecha']}  |  {dinero(p['total'])}  |  {p.get('estado', 'Pendiente')}")
+                st.markdown(
+                    f'<div class="hist-titulo">N° {p["id"]:04d} — {esc(p["cliente_nombre"])}</div>'
+                    f'<div class="hist-detalle">{esc(p["fecha"])} &nbsp;|&nbsp; <strong>{moneda(p["total"])}</strong>'
+                    f' &nbsp; {estado_pill(estado_p)}</div>',
+                    unsafe_allow_html=True,
+                )
 
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     nuevo_estado = st.selectbox(
                         "Estado",
                         ESTADOS,
-                        index=ESTADOS.index(p.get("estado", "Pendiente")),
+                        index=ESTADOS.index(estado_p) if estado_p in ESTADOS else 0,
                         key=f"estado_{p['id']}",
                         label_visibility="collapsed",
                     )
-                    if nuevo_estado != p.get("estado", "Pendiente"):
+                    if nuevo_estado != estado_p:
                         for item_h in historial:
                             if item_h["id"] == p["id"]:
                                 item_h["estado"] = nuevo_estado
@@ -1610,13 +2199,14 @@ with tab_historial:
 
                 with col2:
                     try:
-                        pdf_bytes_hist = generar_pdf(p, st.session_state.empresa)
+                        pdf_bytes_hist = pdf_del_historial(p, st.session_state.empresa)
                         st.download_button(
                             "Descargar PDF",
                             data=pdf_bytes_hist,
                             file_name=f"presupuesto_{p['id']:04d}_{p['cliente_nombre'].replace(' ', '_')}.pdf",
                             mime="application/pdf",
                             key=f"desc_{p['id']}",
+                            width="stretch",
                         )
                     except Exception as e:
                         st.error(f"No se pudo generar el PDF: {e}")
@@ -1630,7 +2220,7 @@ with tab_historial:
                         width="stretch",
                     )
 
-                with st.expander("Ver ítems"):
+                with st.expander("Ver conceptos"):
                     for item in p["items"]:
                         st.write(
                             f"- {item['descripcion']} — {item['cantidad']:g} x "
